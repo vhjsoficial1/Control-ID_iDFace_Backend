@@ -1,0 +1,273 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-py"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Usuário (Funcionário)
+model User {
+  id              Int       @id @default(autoincrement())
+  idFaceId        Int?      @unique // ID no sistema iDFace
+  name            String
+  registration    String?   @unique // Matrícula
+  password        String?   // Senha (hashed)
+  salt            String?   // Salt para senha
+  beginTime       DateTime? // Data início validade
+  endTime         DateTime? // Data fim validade
+  image           String?   // Base64 da imagem facial
+  imageTimestamp  DateTime?
+  
+  // Relacionamentos
+  cards           Card[]
+  qrcodes         QRCode[]
+  templates       Template[]
+  accessLogs      AccessLog[]
+  userGroups      UserGroup[]
+  userAccessRules UserAccessRule[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("users")
+}
+
+// Cartões de acesso
+model Card {
+  id        Int      @id @default(autoincrement())
+  value     BigInt   @unique // Número do cartão
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  
+  @@map("cards")
+}
+
+// QR Codes
+model QRCode {
+  id        Int      @id @default(autoincrement())
+  value     String   @unique
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  
+  @@map("qrcodes")
+}
+
+// Templates biométricos
+model Template {
+  id         Int    @id @default(autoincrement())
+  fingerType Int    @default(0)
+  template   String // Base64 do template
+  userId     Int
+  user       User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  createdAt  DateTime @default(now())
+  
+  @@map("templates")
+}
+
+// Regras de acesso
+model AccessRule {
+  id       Int    @id @default(autoincrement())
+  name     String
+  type     Int    @default(1)
+  priority Int    @default(0)
+  
+  idFaceId Int?   @unique // ID no iDFace
+  
+  // Relacionamentos
+  timeZones           AccessRuleTimeZone[]
+  userAccessRules     UserAccessRule[]
+  groupAccessRules    GroupAccessRule[]
+  portalAccessRules   PortalAccessRule[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("access_rules")
+}
+
+// Time Zones (Horários)
+model TimeZone {
+  id        Int      @id @default(autoincrement())
+  name      String
+  
+  idFaceId  Int?     @unique
+  
+  // Relacionamentos
+  timeSpans           TimeSpan[]
+  accessRuleTimeZones AccessRuleTimeZone[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("time_zones")
+}
+
+// Time Spans (Intervalos de tempo)
+model TimeSpan {
+  id         Int      @id @default(autoincrement())
+  timeZoneId Int
+  timeZone   TimeZone @relation(fields: [timeZoneId], references: [id], onDelete: Cascade)
+  
+  start Int // Segundos desde meia-noite
+  end   Int // Segundos desde meia-noite
+  
+  // Dias da semana (0 = não, 1 = sim)
+  sun Boolean @default(false)
+  mon Boolean @default(false)
+  tue Boolean @default(false)
+  wed Boolean @default(false)
+  thu Boolean @default(false)
+  fri Boolean @default(false)
+  sat Boolean @default(false)
+  
+  // Feriados
+  hol1 Boolean @default(false)
+  hol2 Boolean @default(false)
+  hol3 Boolean @default(false)
+  
+  createdAt DateTime @default(now())
+  
+  @@map("time_spans")
+}
+
+// Relacionamento AccessRule <-> TimeZone
+model AccessRuleTimeZone {
+  id           Int        @id @default(autoincrement())
+  accessRuleId Int
+  timeZoneId   Int
+  
+  accessRule AccessRule @relation(fields: [accessRuleId], references: [id], onDelete: Cascade)
+  timeZone   TimeZone   @relation(fields: [timeZoneId], references: [id], onDelete: Cascade)
+  
+  @@unique([accessRuleId, timeZoneId])
+  @@map("access_rule_time_zones")
+}
+
+// Grupos de usuários
+model Group {
+  id       Int    @id @default(autoincrement())
+  name     String
+  
+  idFaceId Int?   @unique
+  
+  // Relacionamentos
+  userGroups       UserGroup[]
+  groupAccessRules GroupAccessRule[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("groups")
+}
+
+// Relacionamento User <-> Group
+model UserGroup {
+  id      Int   @id @default(autoincrement())
+  userId  Int
+  groupId Int
+  
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId, groupId])
+  @@map("user_groups")
+}
+
+// Relacionamento User <-> AccessRule
+model UserAccessRule {
+  id           Int        @id @default(autoincrement())
+  userId       Int
+  accessRuleId Int
+  
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessRule AccessRule @relation(fields: [accessRuleId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId, accessRuleId])
+  @@map("user_access_rules")
+}
+
+// Relacionamento Group <-> AccessRule
+model GroupAccessRule {
+  id           Int        @id @default(autoincrement())
+  groupId      Int
+  accessRuleId Int
+  
+  group      Group      @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  accessRule AccessRule @relation(fields: [accessRuleId], references: [id], onDelete: Cascade)
+  
+  @@unique([groupId, accessRuleId])
+  @@map("group_access_rules")
+}
+
+// Portais (Portas/Catracas)
+model Portal {
+  id   Int    @id @default(autoincrement())
+  name String
+  
+  idFaceId Int? @unique
+  
+  // Relacionamentos
+  portalAccessRules PortalAccessRule[]
+  accessLogs        AccessLog[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("portals")
+}
+
+// Relacionamento Portal <-> AccessRule
+model PortalAccessRule {
+  id           Int        @id @default(autoincrement())
+  portalId     Int
+  accessRuleId Int
+  
+  portal     Portal     @relation(fields: [portalId], references: [id], onDelete: Cascade)
+  accessRule AccessRule @relation(fields: [accessRuleId], references: [id], onDelete: Cascade)
+  
+  @@unique([portalId, accessRuleId])
+  @@map("portal_access_rules")
+}
+
+// Logs de acesso (Auditoria)
+model AccessLog {
+  id        Int      @id @default(autoincrement())
+  userId    Int?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  
+  portalId  Int?
+  portal    Portal?  @relation(fields: [portalId], references: [id], onDelete: SetNull)
+  
+  event     String   // "access_granted", "access_denied", "unknown_user"
+  reason    String?  // Motivo da negação
+  cardValue String?  // Número do cartão usado
+  
+  timestamp DateTime @default(now())
+  
+  @@map("access_logs")
+}
+
+// Cargo/Função
+model Position {
+  id          Int    @id @default(autoincrement())
+  name        String @unique
+  description String?
+  
+  // Horário padrão do cargo
+  defaultStartTime String? // "08:00"
+  defaultEndTime   String? // "17:00"
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("positions")
+}

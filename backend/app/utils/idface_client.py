@@ -1,6 +1,6 @@
 """
-HTTP Client for iDFace API communication
-Handles session management and requests to the Control ID device
+Cliente HTTP para comunicação com a API iDFace
+Lida com o gerenciamento de sessões e solicitações ao dispositivo de ID de controle facial iDFace
 """
 import httpx
 from typing import Optional, Dict, Any
@@ -25,7 +25,7 @@ class IDFaceClient:
         await self.client.aclose()
     
     async def login(self) -> str:
-        """Create session with iDFace device"""
+        """Criar sessão com dispositivo iDFace"""
         url = f"{self.base_url}/login.fcgi"
         payload = {
             "login": settings.IDFACE_LOGIN,
@@ -42,7 +42,7 @@ class IDFaceClient:
         return self.session
     
     async def logout(self):
-        """End current session"""
+        """Encerrar sessão atual"""
         if not self.session:
             return
         
@@ -58,7 +58,7 @@ class IDFaceClient:
             self.session_expires = None
     
     async def ensure_session(self):
-        """Ensure we have a valid session"""
+        """Garantir que temos uma sessão válida"""
         if not self.session or (self.session_expires and datetime.now() >= self.session_expires):
             await self.login()
     
@@ -68,7 +68,7 @@ class IDFaceClient:
         endpoint: str, 
         **kwargs
     ) -> Dict[str, Any]:
-        """Make authenticated request to iDFace"""
+        """Faça uma solicitação autenticada ao iDFace"""
         await self.ensure_session()
         
         url = f"{self.base_url}/{endpoint}"
@@ -79,7 +79,7 @@ class IDFaceClient:
         response = await self.client.request(method, url, **kwargs)
         response.raise_for_status()
         
-        # Some endpoints don't return JSON
+        # Alguns endpoints não retornam JSON
         try:
             return response.json()
         except:
@@ -88,7 +88,7 @@ class IDFaceClient:
     # ==================== User Operations ====================
     
     async def create_user(self, user_data: Dict) -> Dict:
-        """Create user in iDFace"""
+        """Criar usuário no iDFace"""
         return await self.request(
             "POST",
             "create_objects.fcgi",
@@ -99,7 +99,7 @@ class IDFaceClient:
         )
     
     async def update_user(self, user_id: int, user_data: Dict) -> Dict:
-        """Update user in iDFace"""
+        """Atualizar usuário no iDFace"""
         return await self.request(
             "POST",
             "modify_objects.fcgi",
@@ -113,7 +113,7 @@ class IDFaceClient:
         )
     
     async def delete_user(self, user_id: int) -> Dict:
-        """Delete user from iDFace"""
+        """Deletar usuário no iDFace"""
         return await self.request(
             "POST",
             "destroy_objects.fcgi",
@@ -126,7 +126,7 @@ class IDFaceClient:
         )
     
     async def load_users(self, where: Optional[Dict] = None) -> Dict:
-        """Load users from iDFace"""
+        """Carregar informações de usuários do iDFace"""
         payload = {"object": "users"}
         if where:
             payload["where"] = where
@@ -146,7 +146,7 @@ class IDFaceClient:
         match: bool = True,
         timestamp: Optional[int] = None
     ) -> Dict:
-        """Upload facial image for user"""
+        """Carregar imagem facial para usuário"""
         if timestamp is None:
             timestamp = int(datetime.now().timestamp())
         
@@ -165,7 +165,7 @@ class IDFaceClient:
         )
     
     async def set_user_image_list(self, user_images: list) -> Dict:
-        """Upload multiple user images"""
+        """Carregar várias imagens de usuário"""
         return await self.request(
             "POST",
             "user_set_image_list.fcgi",
@@ -176,7 +176,7 @@ class IDFaceClient:
         )
     
     async def get_user_image(self, user_id: int) -> bytes:
-        """Download user image"""
+        """Baixar imagem do usuário"""
         await self.ensure_session()
         url = f"{self.base_url}/user_get_image.fcgi"
         params = {"session": self.session, "user_id": user_id}
@@ -186,7 +186,7 @@ class IDFaceClient:
         return response.content
     
     async def delete_user_images(self, user_ids: list[int]) -> Dict:
-        """Delete user images"""
+        """Deletar imagem do usuário"""
         return await self.request(
             "POST",
             "user_destroy_image.fcgi",
@@ -196,7 +196,7 @@ class IDFaceClient:
     # ==================== Access Rules ====================
     
     async def create_access_rule(self, rule_data: Dict) -> Dict:
-        """Create access rule"""
+        """Criar regra de acesso"""
         return await self.request(
             "POST",
             "create_objects.fcgi",
@@ -207,7 +207,7 @@ class IDFaceClient:
         )
     
     async def load_access_rules(self) -> Dict:
-        """Load all access rules"""
+        """Carregar todas as regras de acesso"""
         return await self.request(
             "POST",
             "load_objects.fcgi",
@@ -217,7 +217,7 @@ class IDFaceClient:
     # ==================== Time Zones ====================
     
     async def create_time_zone(self, tz_data: Dict) -> Dict:
-        """Create time zone"""
+        """Criar fuso horário"""
         return await self.request(
             "POST",
             "create_objects.fcgi",
@@ -228,7 +228,7 @@ class IDFaceClient:
         )
     
     async def create_time_span(self, span_data: Dict) -> Dict:
-        """Create time span"""
+        """Criar intervalo de tempo"""
         return await self.request(
             "POST",
             "create_objects.fcgi",
@@ -241,7 +241,7 @@ class IDFaceClient:
     # ==================== Access Logs ====================
     
     async def load_access_logs(self) -> Dict:
-        """Load access logs from device"""
+        """Carregar logs de acesso do dispositivo"""
         return await self.request(
             "POST",
             "load_objects.fcgi",
@@ -251,7 +251,7 @@ class IDFaceClient:
     # ==================== User Access Rules ====================
     
     async def create_user_access_rule(self, user_id: int, access_rule_id: int) -> Dict:
-        """Link user to access rule"""
+        """Vincular usuário à regra de acesso"""
         return await self.request(
             "POST",
             "create_objects.fcgi",
@@ -267,7 +267,7 @@ class IDFaceClient:
     # ==================== Cards ====================
     
     async def create_card(self, card_value: int, user_id: int) -> Dict:
-        """Register card for user"""
+        """Registrar cartão para usuário"""
         return await self.request(
             "POST",
             "create_objects.fcgi",
@@ -283,21 +283,21 @@ class IDFaceClient:
     # ==================== System ====================
     
     async def get_system_info(self) -> Dict:
-        """Get device system information"""
+        """Obtenha informações do sistema do dispositivo"""
         return await self.request(
             "POST",
             "system_information.fcgi"
         )
     
     async def reboot(self) -> Dict:
-        """Reboot device"""
+        """Reinicializar dispositivo"""
         return await self.request(
             "POST",
             "reboot.fcgi"
         )
     
     async def execute_actions(self, actions: list) -> Dict:
-        """Execute actions (open door, etc)"""
+        """Executar ações (abrir porta, etc.)"""
         return await self.request(
             "POST",
             "execute_actions.fcgi",

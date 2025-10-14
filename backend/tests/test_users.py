@@ -2,33 +2,6 @@
 Testes para operações de usuários
 """
 import pytest
-from httpx import AsyncClient
-from app.main import app
-from app.database import connect_db, disconnect_db
-import asyncio
-
-
-@pytest.fixture(scope="module")
-def event_loop():
-    """Cria event loop para testes"""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="module", autouse=True)
-async def setup_database():
-    """Setup e teardown do banco de dados"""
-    await connect_db()
-    yield
-    await disconnect_db()
-
-
-@pytest.fixture
-async def client():
-    """Cliente HTTP para testes"""
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        yield ac
 
 
 # ==================== Testes CRUD Usuários ====================

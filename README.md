@@ -50,6 +50,8 @@ backend/
 │
 ├── .env                           # Environment variables (create from .env.example)
 ├── .env.example                   # ✅ Template
+├── dcoker-compose.yml             # ✅ Docker Compose
+├── Dockerfile                     # ✅ Dockerfile
 ├── requirements.txt               # ✅ Dependencies
 ├── test_idface_connection.py      # ✅ Standalone connection test
 └── README.md
@@ -57,53 +59,102 @@ backend/
 
 ---
 
-## ⚙️ Setup do Projeto
+## 🚀 Começando
 
-### 1️⃣ Criar ambiente virtual
-```bash
-python -m venv venv
-```
+Você pode rodar este projeto de duas maneiras: localmente com um ambiente Python ou usando Docker.
 
-### 2️⃣ Ativar ambiente
-- **Windows**
-  ```bash
-  venv\Scripts\activate
-  ```
-- **Linux/Mac**
-  ```bash
-  source venv/bin/activate
-  ```
+### 🐳 Rodando com Docker (Recomendado)
 
-### 3️⃣ Instalar dependências
-```bash
-pip install -r requirements.txt
-```
+Este método provisiona a API e o banco de dados (PostgreSQL) em containers Docker, simplificando a configuração.
 
-### 4️⃣ Configurar variáveis de ambiente
-```bash
-cp .env.example .env
-```
-> Edite o arquivo `.env` com suas credenciais e configurações.
+1.  **Pré-requisitos:**
+    *   [Docker](https://www.docker.com/get-started)
+    *   [Docker Compose](https://docs.docker.com/compose/install/)
 
-### 5️⃣ Gerar cliente Prisma
-```bash
-prisma generate
-```
+2.  **Clone o repositório e navegue até a pasta `backend`:**
+    ```bash
+    git clone <URL_DO_REPOSITORIO>
+    cd Control-ID_iDFace_API/backend
+    ```
 
-### 6️⃣ Criar banco de dados
-```bash
-prisma db push
-```
+3.  **Configure as variáveis de ambiente:**
+    Copie o arquivo de exemplo `.env.example` para um novo arquivo chamado `.env`.
+    ```bash
+    cp .env.example .env
+    ```
+    > **Importante:** Abra o arquivo `.env` e preencha as credenciais do iDFace e outras configurações necessárias. A `DATABASE_URL` já vem pré-configurada para o ambiente Docker.
 
-### 7️⃣ Testar conexão com o dispositivo iDFace
-```bash
-python test_idface_connection.py
-```
+4.  **Construa e inicie os containers:**
+    Execute o comando abaixo para construir as imagens e iniciar os serviços em segundo plano.
+    ```bash
+    docker-compose up -d --build
+    ```
 
-### 8️⃣ Iniciar servidor FastAPI
-```bash
-uvicorn app.main:app --reload --port 8000
-```
+5.  **Verifique os logs (opcional):**
+    Para acompanhar os logs da aplicação em tempo real, use:
+    ```bash
+    docker-compose logs -f api
+    ```
+
+6.  **Acessando a API:**
+    A API estará disponível em `http://localhost:8000`.
+    *   **Swagger UI:** `http://localhost:8000/docs`
+    *   **ReDoc:** `http://localhost:8000/redoc`
+
+7.  **Visualizando o Banco de Dados:**
+    Para abrir o Prisma Studio e interagir com o banco de dados, execute:
+    ```bash
+    npx prisma studio
+    ```
+    > O Prisma Studio estará disponível em `http://localhost:5555`.
+
+8.  **Parando os containers:**
+    Para parar todos os serviços, execute:
+    ```bash
+    docker-compose down
+    ```
+
+---
+
+### 🛠️ Setup Local (Sem Docker)
+
+Siga estes passos se preferir rodar a aplicação diretamente na sua máquina.
+
+1.  **Criar ambiente virtual:**
+    ```bash
+    python -m venv venv
+    ```
+
+2.  **Ativar ambiente:**
+    *   **Windows:** `venv\Scripts\activate`
+    *   **Linux/Mac:** `source venv/bin/activate`
+
+3.  **Instalar dependências:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **Configurar variáveis de ambiente:**
+    ```bash
+    cp .env.example .env
+    ```
+    > Edite o arquivo `.env` com suas credenciais e a URL do seu banco de dados.
+
+5.  **Gerar cliente Prisma:**
+    ```bash
+    prisma generate
+    ```
+
+6.  **Aplicar schema no banco de dados:**
+    Este comando cria as tabelas no banco de dados com base no `schema.prisma`.
+    ```bash
+    prisma db push
+    ```
+
+7.  **Iniciar servidor FastAPI:**
+    ```bash
+    uvicorn app.main:app --reload --port 8000
+    ```
 
 ---
 
@@ -124,11 +175,12 @@ uvicorn app.main:app --reload --port 8000
 
 ## 🧩 Tecnologias Principais
 
-- **FastAPI** — Framework web moderno e performático  
-- **Prisma ORM** — Integração de banco de dados  
-- **Python 3.10+** — Linguagem base  
-- **Uvicorn** — Servidor ASGI  
-- **iDFace API** — Integração para controle de acesso facial  
+- **FastAPI** — Framework web moderno e performático
+- **Prisma ORM** — Integração de banco de dados
+- **Docker & Docker Compose** — Containerização
+- **Python 3.10+** — Linguagem base
+- **Uvicorn** — Servidor ASGI
+- **iDFace API** — Integração para controle de acesso facial
 
 ---
 

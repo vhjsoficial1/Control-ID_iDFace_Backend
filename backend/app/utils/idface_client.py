@@ -22,7 +22,7 @@ class IDFaceClient:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.logout()
-        await self.client.aclose()
+        # await self.client.aclose()
     
     async def login(self) -> str:
         """Criar sessão com dispositivo iDFace"""

@@ -4,17 +4,27 @@ Execute: python test_idface_connection.py
 """
 import asyncio
 import httpx
+import os
+from dotenv import load_dotenv
 from datetime import datetime
 
+# Carrega variáveis de ambiente do arquivo .env
+load_dotenv()
 
-# Configurações do leitor
-IDFACE_IP = "169.254.111.129"
-IDFACE_LOGIN = "admin"
-IDFACE_PASSWORD = "admin"
+# Configurações do leitor a partir das variáveis de ambiente
+IDFACE_IP = os.getenv("IDFACE_IP")
+IDFACE_LOGIN = os.getenv("IDFACE_LOGIN")
+IDFACE_PASSWORD = os.getenv("IDFACE_PASSWORD")
 
 
 async def test_connection():
     """Testa conexão básica com o leitor iDFace"""
+    
+    if not all([IDFACE_IP, IDFACE_LOGIN, IDFACE_PASSWORD]):
+        print("❌ ERRO: Variáveis de ambiente não configuradas!")
+        print("Verifique se as variáveis IDFACE_IP, IDFACE_LOGIN, e IDFACE_PASSWORD estão no arquivo .env")
+        return
+
     base_url = f"http://{IDFACE_IP}"
     
     print("🔌 Testando conexão com iDFace...")

@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:13
+    container_name: idface_db
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: idface_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build: .
+    container_name: idface_api
+    restart: always
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: "postgresql://user:password@db:5432/idface_db"
+      IDFACE_IP: "${IDFACE_IP}"
+      IDFACE_GATEWAY: "${IDFACE_GATEWAY}"
+      IDFACE_NETMASK: "${IDFACE_NETMASK}"
+      IDFACE_LOGIN: "${IDFACE_LOGIN}"
+      IDFACE_PASSWORD: "${IDFACE_PASSWORD}"
+      API_SECRET_KEY: "${API_SECRET_KEY}"
+
+volumes:
+  postgres_data:

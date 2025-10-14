@@ -5,6 +5,8 @@ from app.schemas.user import (
     UserImageUpload, BulkImageUpload, UserSyncRequest, UserSyncResponse
 )
 from app.database import get_db
+from app.services.user_service import UserService
+from app.services.sync_service import SyncService
 from app.utils.idface_client import idface_client
 from typing import Optional
 import base64
@@ -17,24 +19,44 @@ router = APIRouter()
 @router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(user: UserCreate, db = Depends(get_db)):
     """
-    Cria um novo usuário no banco de dados local
+    Cria um novo usuário no banco de dados local e o sincroniza automaticamente com o iDFace.
     """
-    try:
-        new_user = await db.user.create(
-            data={
-                "name": user.name,
-                "registration": user.registration,
-                "beginTime": user.beginTime,
-                "endTime": user.endTime,
-                "password": user.password  # TODO: Hash password
-            }
-        )
-        return new_user
-    except Exception as e:
+    user_service = UserService(db)
+    sync_service = SyncService(db)
+
+    # 1. Criar usuário localmente usando o serviço
+    create_result = await user_service.create_user(
+        name=user.name,
+        registration=user.registration or None, # Garante que matrícula vazia vire NULO
+        password=user.password,
+        begin_time=user.beginTime,
+        end_time=user.endTime,
+        image=user.image
+    )
+
+    if not create_result.get("success"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Erro ao criar usuário: {str(e)}"
+            detail=f"Erro ao criar usuário: {create_result.get('errors', ['Erro desconhecido.'])}"
         )
+
+    new_user = create_result["user"]
+
+    # 2. Sincronizar com iDFace automaticamente
+    try:
+        print(f"Iniciando sincronização para o novo usuário ID: {new_user.id}")
+        sync_result = await sync_service.sync_user_to_idface(user_id=new_user.id)
+        if not sync_result.get("success"):
+            # A sincronização falhou, mas o usuário local foi criado.
+            # Idealmente, isso seria tratado por uma fila de retentativas (background task).
+            # Por agora, apenas registramos o aviso.
+            print(f"AVISO: Usuário {new_user.id} criado localmente, mas falhou ao sincronizar com o iDFace: {sync_result.get('error')}")
+    except Exception as e:
+        print(f"AVISO: Usuário {new_user.id} criado localmente, mas uma exceção ocorreu durante a sincronização: {str(e)}")
+
+    # 3. Retornar os dados finais do usuário (que pode ter sido atualizado com o idFaceId)
+    final_user = await db.user.find_unique(where={"id": new_user.id})
+    return final_user
 
 
 @router.get("/", response_model=UserListResponse)

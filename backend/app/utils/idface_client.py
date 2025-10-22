@@ -280,6 +280,35 @@ class IDFaceClient:
             }
         )
     
+    # ==================== Face Capture ====================
+    
+    async def start_face_capture(self, quality: int = 70) -> Dict:
+        """Inicia a captura de face no dispositivo"""
+        return await self.request(
+            "POST",
+            "face_start_capture.fcgi",
+            params={
+                "quality": quality
+            }
+        )
+    
+    async def get_capture_status(self) -> Dict:
+        """Verifica o status da captura de face"""
+        return await self.request(
+            "POST",
+            "face_get_status.fcgi"
+        )
+    
+    async def get_captured_face(self) -> bytes:
+        """Obtém a imagem da face capturada"""
+        await self.ensure_session()
+        url = f"{self.base_url}/face_get_image.fcgi"
+        params = {"session": self.session}
+        
+        response = await self.client.post(url, params=params)
+        response.raise_for_status()
+        return response.content
+
     # ==================== System ====================
     
     async def get_system_info(self) -> Dict:

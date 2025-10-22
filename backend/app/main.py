@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import connect_db, disconnect_db
-from app.routers import users, access_rules, time_zones, audit, sync, system, backup, report
+from app.routers import users, access_rules, time_zones, audit, sync, system, backup, report, realtime
 
 
 app = FastAPI(
@@ -47,3 +47,4 @@ app.include_router(sync.router, prefix="/api/v1/sync", tags=["Synchronization"])
 app.include_router(system.router, prefix="/api/v1/system", tags=["System"])
 app.include_router(backup.router, prefix="/api/v1/backup", tags=["Backup"])
 app.include_router(report.router, prefix="/api/v1/report", tags=["Report"])
+app.include_router(realtime.router, prefix="/api/v1/realtime", tags=["Realtime Monitoring"])

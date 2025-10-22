@@ -4,6 +4,9 @@ FROM python:3.9-slim
 # Set the working directory in the container
 WORKDIR /app
 
+# Install system dependencies required by Prisma
+RUN apt-get update && apt-get install -y libatomic1
+
 # Install Prisma CLI
 RUN pip install prisma
 

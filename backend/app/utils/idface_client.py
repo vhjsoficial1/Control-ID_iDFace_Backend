@@ -282,12 +282,18 @@ class IDFaceClient:
     
     # ==================== Face Capture ====================
     
-    async def start_face_capture(self, quality: int = 70) -> Dict:
-        """Inicia a captura de face no dispositivo"""
+    async def start_face_capture(self, user_id: int, quality: int = 70) -> Dict:
+        """Inicia a captura de face no dispositivo usando registro remoto"""
         return await self.request(
             "POST",
-            "face_start_capture.fcgi",
-            params={
+            "remote_enroll.fcgi",
+            json={
+                "type": "face",
+                "user_id": user_id,
+                "save": True,
+                "sync": True,
+                "auto": True,
+                "countdown": 3,
                 "quality": quality
             }
         )

@@ -19,38 +19,68 @@ router = APIRouter()
 @router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(user: UserCreate, db = Depends(get_db)):
     """
-    Cria um novo usuário no banco de dados local e o sincroniza automaticamente com o iDFace.
+    Cria um novo usuário seguindo o fluxo:
+    1. Cadastra no banco local
+    2. Sincroniza com o leitor
+    3. Busca o ID correto no leitor
+    4. Atualiza o banco local com o ID do leitor
     """
     user_service = UserService(db)
     sync_service = SyncService(db)
 
-    # 1. Criar usuário localmente usando o serviço
-    create_result = await user_service.create_user(
-        name=user.name,
-        registration=user.registration or None, # Garante que matrícula vazia vire NULO
+    # 1. Criar usuário localmente primeiro
+    create_result = await user_service.create_user(name=user.name,
+        registration=user.registration or None,
         password=user.password,
         begin_time=user.beginTime,
         end_time=user.endTime,
-        image=user.image
-    )
+        image=user.image)
 
     if not create_result.get("success"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Erro ao criar usuário: {create_result.get('errors', ['Erro desconhecido.'])}"
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Erro ao criar usuário: {create_result.get('errors', ['Erro desconhecido.'])}")
 
     new_user = create_result["user"]
-
-    # 2. Sincronizar com iDFace automaticamente
+    
+    # 2. Sincronizar com o leitor e obter ID correto
     try:
-        print(f"Iniciando sincronização para o novo usuário ID: {new_user.id}")
-        sync_result = await sync_service.sync_user_to_idface(user_id=new_user.id)
-        if not sync_result.get("success"):
-            # A sincronização falhou, mas o usuário local foi criado.
-            # Idealmente, isso seria tratado por uma fila de retentativas (background task).
-            # Por agora, apenas registramos o aviso.
-            print(f"AVISO: Usuário {new_user.id} criado localmente, mas falhou ao sincronizar com o iDFace: {sync_result.get('error')}")
+        async with idface_client:
+            # Criar usuário no leitor
+            idface_data = {"name": new_user.name,
+                "registration": new_user.registration or "",
+                "password": new_user.password or "",
+                "salt": new_user.salt or ""}
+            
+            await idface_client.create_user(idface_data)
+            
+            # Buscar usuário no leitor para confirmar os dados
+            search_result = await idface_client.load_users(where={"users": {
+                "name": new_user.name,
+                "registration": new_user.registration}})
+            
+            idface_users = search_result.get("users", [])
+            if not idface_users:
+                raise ValueError("Usuário não encontrado no leitor após criação")
+            
+            # Pegar o primeiro match e atualizar o banco local
+            idface_user = idface_users[0]
+            idface_id = idface_user["id"]
+            
+            # Atualizar o idFaceId no banco local
+            new_user = await db.user.update(
+                where={"id": new_user.id},
+                data={"idFaceId": idface_id}
+            )
+            
+            return new_user
+            
+    except Exception as e:
+        # Se algo der errado, deletar o usuário local
+        await db.user.delete(where={"id": new_user.id})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao sincronizar com o leitor: {str(e)}"
+        )
     except Exception as e:
         print(f"AVISO: Usuário {new_user.id} criado localmente, mas uma exceção ocorreu durante a sincronização: {str(e)}")
 

@@ -384,18 +384,39 @@ async def sync_time_zone_to_idface(tz_id: int, db = Depends(get_db)):
             detail=f"Time zone {tz_id} não encontrado"
         )
     
-    try:
-        async with idface_client:
-            # Criar time zone no iDFace
-            result_tz = await idface_client.create_time_zone({
-                "name": tz.name
-            })
-            
-            # Sincronizar time spans
-            if tz.timeSpans:
-                for span in tz.timeSpans:
-                    await idface_client.create_time_span({
-                        "time_zone_id": tz.idFaceId,  # Usar ID do iDFace
+    async with idface_client:
+        # 1. Criar time zone no iDFace
+        try:
+            tz_payload = {"name": tz.name}
+            result_tz = await idface_client.create_time_zone(tz_payload)
+        except Exception as e:
+            # Raise HTTPException directly with detailed error
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Falha ao criar time_zone no iDFace. Payload: {tz_payload}. Erro: {e}"
+            )
+
+        # 2. Extrair o novo ID do iDFace da resposta
+        if not result_tz.get("ids"):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Falha ao obter ID do iDFace para o time zone. Resposta: {result_tz}"
+            )
+        
+        idface_id = result_tz["ids"][0]
+        
+        # 3. Salvar o novo idFaceId no banco de dados local
+        await db.timezone.update(
+            where={"id": tz_id},
+            data={"idFaceId": idface_id}
+        )
+        
+        # 4. Sincronizar time spans
+        if tz.timeSpans:
+            for span in tz.timeSpans:
+                try:
+                    span_payload = {
+                        "time_zone_id": idface_id,
                         "start": span.start,
                         "end": span.end,
                         "sun": 1 if span.sun else 0,
@@ -408,19 +429,21 @@ async def sync_time_zone_to_idface(tz_id: int, db = Depends(get_db)):
                         "hol1": 1 if span.hol1 else 0,
                         "hol2": 1 if span.hol2 else 0,
                         "hol3": 1 if span.hol3 else 0
-                    })
-            
-            return {
-                "success": True,
-                "message": "Time zone sincronizado com sucesso",
-                "timeSpansCount": len(tz.timeSpans) if tz.timeSpans else 0
-            }
-            
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro ao sincronizar: {str(e)}"
-        )
+                    }
+                    await idface_client.create_time_span(span_payload)
+                except Exception as e:
+                    # Raise HTTPException directly with detailed error
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Falha ao criar time_span no iDFace. Payload: {span_payload}. Erro: {e}"
+                    )
+        
+        return {
+            "success": True,
+            "message": "Time zone sincronizado com sucesso",
+            "idFaceId": idface_id,
+            "timeSpansCount": len(tz.timeSpans) if tz.timeSpans else 0
+        }
 
 
 # ==================== Link Time Zone to Access Rule ====================

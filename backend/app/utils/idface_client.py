@@ -197,13 +197,19 @@ class IDFaceClient:
     
     async def create_access_rule(self, rule_data: Dict) -> Dict:
         """Criar regra de acesso"""
+        payload = {
+            "object": "access_rules",
+            "values": [rule_data],
+            # Adicionado com base na análise de uma solicitação bem-sucedida
+            "join": "LEFT",
+            "fields": ["id", "name", "type", "priority"],
+            "where": [],
+            "order": ["name"]
+        }
         return await self.request(
             "POST",
             "create_objects.fcgi",
-            json={
-                "object": "access_rules",
-                "values": [rule_data]
-            }
+            json=payload
         )
     
     async def load_access_rules(self) -> Dict:

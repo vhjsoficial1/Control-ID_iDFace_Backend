@@ -189,27 +189,69 @@ async def list_access_rules(
     db = Depends(get_db)
 ):
     """
-    Lista todas as regras de acesso com detalhes
+    Lista todas as regras de acesso com detalhes, incluindo usuários de grupos.
     """
-    include_config = {
-        "timeZones": {"include": {"timeZone": True}},
-        "portalAccessRules": {"include": {"portal": True}},
-        "userAccessRules": {"include": {"user": True}}
-    } if include_details else False
-    
-    rules = await db.accessrule.find_many(
+    include_config = {}
+    if include_details:
+        include_config = {
+            "timeZones": {"include": {"timeZone": True}},
+            "portalAccessRules": {"include": {"portal": True}},
+            "userAccessRules": {"include": {"user": True}},
+            "groupAccessRules": {
+                "include": {
+                    "group": {
+                        "include": {
+                            "userGroups": {"include": {"user": True}}
+                        }
+                    }
+                }
+            }
+        }
+
+    rules_from_db = await db.accessrule.find_many(
         skip=skip,
         take=limit,
-        order_by={"priority": "asc"},
+        order={"priority": "asc"},
         include=include_config
     )
-    return rules
+
+    response_rules = []
+    for rule in rules_from_db:
+        all_users = {}
+        if include_details:
+            # Adiciona usuários diretamente ligados à regra
+            if hasattr(rule, 'userAccessRules') and rule.userAccessRules:
+                for uar in rule.userAccessRules:
+                    if uar.user:
+                        all_users[uar.user.id] = uar.user
+            
+            # Adiciona usuários de grupos ligados à regra
+            if hasattr(rule, 'groupAccessRules') and rule.groupAccessRules:
+                for gar in rule.groupAccessRules:
+                    if gar.group and hasattr(gar.group, 'userGroups') and gar.group.userGroups:
+                        for ug in gar.group.userGroups:
+                            if ug.user:
+                                all_users[ug.user.id] = ug.user
+
+        rule_dict = {
+            "id": rule.id,
+            "name": rule.name,
+            "type": rule.type,
+            "priority": rule.priority,
+            "idFaceId": rule.idFaceId,
+            "timeZones": [art.timeZone.model_dump() for art in rule.timeZones if art.timeZone] if include_details and hasattr(rule, 'timeZones') else [],
+            "portals": [par.portal.model_dump() for par in rule.portalAccessRules if par.portal] if include_details and hasattr(rule, 'portalAccessRules') else [],
+            "users": [user.model_dump() for user in all_users.values()]
+        }
+        response_rules.append(rule_dict)
+        
+    return response_rules
 
 
 @router.get("/{rule_id}", response_model=AccessRuleResponse)
 async def get_access_rule(rule_id: int, db = Depends(get_db)):
     """
-    Busca regra de acesso por ID com todos os relacionamentos
+    Busca regra de acesso por ID com todos os relacionamentos, incluindo usuários de grupos.
     """
     rule = await db.accessrule.find_unique(
         where={"id": rule_id},
@@ -217,7 +259,15 @@ async def get_access_rule(rule_id: int, db = Depends(get_db)):
             "timeZones": {"include": {"timeZone": True}},
             "portalAccessRules": {"include": {"portal": True}},
             "userAccessRules": {"include": {"user": True}},
-            "groupAccessRules": {"include": {"group": True}}
+            "groupAccessRules": {
+                "include": {
+                    "group": {
+                        "include": {
+                            "userGroups": {"include": {"user": True}}
+                        }
+                    }
+                }
+            }
         }
     )
     
@@ -227,7 +277,34 @@ async def get_access_rule(rule_id: int, db = Depends(get_db)):
             detail=f"Regra {rule_id} não encontrada"
         )
     
-    return rule
+    all_users = {}
+
+    # Adiciona usuários diretamente ligados à regra
+    if hasattr(rule, 'userAccessRules') and rule.userAccessRules:
+        for uar in rule.userAccessRules:
+            if uar.user:
+                all_users[uar.user.id] = uar.user
+
+    # Adiciona usuários de grupos ligados à regra
+    if hasattr(rule, 'groupAccessRules') and rule.groupAccessRules:
+        for gar in rule.groupAccessRules:
+            if gar.group and hasattr(gar.group, 'userGroups'):
+                for ug in gar.group.userGroups:
+                    if ug.user:
+                        all_users[ug.user.id] = ug.user
+
+    rule_dict = {
+        "id": rule.id,
+        "name": rule.name,
+        "type": rule.type,
+        "priority": rule.priority,
+        "idFaceId": rule.idFaceId,
+        "timeZones": [art.timeZone.model_dump() for art in rule.timeZones if art.timeZone] if hasattr(rule, 'timeZones') else [],
+        "portals": [par.portal.model_dump() for par in rule.portalAccessRules if par.portal] if hasattr(rule, 'portalAccessRules') else [],
+        "users": [user.model_dump() for user in all_users.values()]
+    }
+        
+    return rule_dict
 
 
 @router.patch("/{rule_id}", response_model=AccessRuleResponse)
@@ -470,7 +547,7 @@ async def list_groups(db = Depends(get_db)):
     """
     Lista todos os grupos
     """
-    groups = await db.group.find_many(order_by={"name": "asc"})
+    groups = await db.group.find_many(order={"name": "asc"})
     return groups
 
 
@@ -698,3 +775,93 @@ async def sync_rule_to_idface(rule_id: int, db = Depends(get_db)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erro ao sincronizar: {str(e)}"
         )
+
+# ==================== User-Rule Management ====================
+
+@router.post("/{rule_id}/users/{user_id}", status_code=status.HTTP_201_CREATED)
+async def link_user_to_rule(
+    rule_id: int,
+    user_id: int,
+    db = Depends(get_db)
+):
+    """
+    Vincula um usuário diretamente a uma regra de acesso.
+    """
+    # Verificações
+    rule = await db.accessrule.find_unique(where={"id": rule_id})
+    if not rule:
+        raise HTTPException(status_code=404, detail="Regra de acesso não encontrada")
+
+    user = await db.user.find_unique(where={"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+
+    # Verificar duplicata
+    existing = await db.useraccessrule.find_first(
+        where={"userId": user_id, "accessRuleId": rule_id}
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Usuário já vinculado diretamente a esta regra")
+
+    # Criar vínculo local
+    await db.useraccessrule.create(
+        data={"userId": user_id, "accessRuleId": rule_id}
+    )
+
+    # Sincronizar com iDFace
+    if rule.idFaceId and user.idFaceId:
+        try:
+            async with idface_client:
+                await idface_client.request(
+                    "POST",
+                    "create_objects.fcgi",
+                    json={
+                        "object": "user_access_rules",
+                        "values": [{
+                            "user_id": user.idFaceId,
+                            "access_rule_id": rule.idFaceId
+                        }]
+                    }
+                )
+        except Exception as e:
+            print(f"Aviso: Erro ao sincronizar vínculo de usuário com iDFace: {e}")
+
+    return {"success": True, "message": f"Usuário '{user.name}' vinculado à regra '{rule.name}'"}
+
+
+@router.delete("/{rule_id}/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def unlink_user_from_rule(rule_id: int, user_id: int, db = Depends(get_db)):
+    """
+    Remove o vínculo direto entre um usuário e uma regra de acesso.
+    """
+    # Encontrar o vínculo no banco local
+    link = await db.useraccessrule.find_first(
+        where={"userId": user_id, "accessRuleId": rule_id},
+        include={"user": True, "accessRule": True}
+    )
+    
+    if not link:
+        raise HTTPException(status_code=404, detail="Vínculo entre usuário e regra não encontrado")
+
+    # Deletar do iDFace primeiro
+    if link.accessRule and link.accessRule.idFaceId and link.user and link.user.idFaceId:
+        try:
+            async with idface_client:
+                await idface_client.request(
+                    "POST",
+                    "destroy_objects.fcgi",
+                    json={
+                        "object": "user_access_rules",
+                        "where": {
+                            "user_access_rules": {
+                                "user_id": link.user.idFaceId,
+                                "access_rule_id": link.accessRule.idFaceId
+                            }
+                        }
+                    }
+                )
+        except Exception as e:
+            print(f"Aviso: Erro ao remover vínculo de usuário no iDFace: {e}")
+
+    # Deletar do banco local
+    await db.useraccessrule.delete(where={"id": link.id})

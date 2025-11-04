@@ -1,316 +1,315 @@
 """
-Rotas de Autenticação e Gerenciamento de Admins
+Rotas de Autenticação - Login e Cadastro de Admins
+backend/app/routers/auth.py
 """
-from fastapi import APIRouter, HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import APIRouter, HTTPException, Depends, status, Response
 from app.database import get_db
-from pydantic import BaseModel
-from datetime import datetime, timedelta
+from app.schemas.auth import (
+    AdminCadastro, AdminLogin, AdminResponse,
+    LoginResponse, LogoutResponse
+)
+from datetime import datetime
 import hashlib
 import secrets
-# import jwt
-from jose import jwt
 
 router = APIRouter()
-security = HTTPBearer()
-
-# Configuração JWT
-SECRET_KEY = "your-secret-key-change-in-production"  # Usar settings.API_SECRET_KEY
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 horas
-
-
-# ==================== Schemas ====================
-
-class AdminCreate(BaseModel):
-    username: str
-    password: str
-    role: str = "admin"  # admin, operator, viewer
-
-
-class AdminLogin(BaseModel):
-    username: str
-    password: str
-
-
-class AdminResponse(BaseModel):
-    id: int
-    username: str
-    role: str
-    active: bool
-    lastLogin: datetime | None
-    
-    class Config:
-        from_attributes = True
-
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    admin: AdminResponse
 
 
 # ==================== Helper Functions ====================
 
 def hash_password(password: str, salt: str) -> str:
-    """Hash de senha com salt"""
-    return hashlib.sha256(f"{password}{salt}".encode()).hexdigest()
-
-
-def create_access_token(data: dict) -> str:
-    """Cria token JWT"""
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-def verify_token(token: str) -> dict:
-    """Verifica e decodifica token JWT"""
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expirado"
-        )
-    except jwt.JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token inválido"
-        )
-
-
-async def get_current_admin(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db = Depends(get_db)
-):
-    """Dependency para obter admin autenticado"""
-    token = credentials.credentials
-    payload = verify_token(token)
-    
-    admin_id = payload.get("admin_id")
-    if not admin_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token inválido"
-        )
-    
-    admin = await db.admin.find_unique(where={"id": admin_id})
-    if not admin or not admin.active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Admin não encontrado ou inativo"
-        )
-    
-    return admin
-
-
-# ==================== Rotas ====================
-
-@router.post("/register", response_model=AdminResponse, status_code=status.HTTP_201_CREATED)
-async def register_admin(admin_data: AdminCreate, db = Depends(get_db)):
     """
-    Registra novo admin (apenas para primeiro setup ou por outro admin)
+    Cria hash SHA256 da senha com salt
     """
-    # Verificar se username já existe
-    existing = await db.admin.find_first(where={"username": admin_data.username})
+    combined = f"{password}{salt}"
+    return hashlib.sha256(combined.encode()).hexdigest()
+
+
+def verify_password(password: str, hashed: str, salt: str) -> bool:
+    """
+    Verifica se a senha está correta
+    """
+    check_hash = hash_password(password, salt)
+    return check_hash == hashed
+
+
+# ==================== CADASTRO ====================
+
+@router.post("/cadastro", response_model=AdminResponse, status_code=status.HTTP_201_CREATED)
+async def cadastro_admin(admin_data: AdminCadastro, db = Depends(get_db)):
+    """
+    Cadastra novo administrador no sistema
+    
+    **Validações:**
+    - Username único (não pode existir outro admin com mesmo nome)
+    - Mínimo 3 caracteres para username
+    - Mínimo 6 caracteres para senha
+    
+    **Retorna:**
+    - Dados do admin criado (sem a senha)
+    """
+    # Validar se username já existe
+    existing = await db.admin.find_first(
+        where={"username": admin_data.username}
+    )
+    
     if existing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username já existe"
+            detail=f"Já existe um admin com o username '{admin_data.username}'"
         )
     
-    # Validar role
-    valid_roles = ["admin", "operator", "viewer"]
-    if admin_data.role not in valid_roles:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Role inválida. Use: {', '.join(valid_roles)}"
-        )
-    
-    # Criar admin
+    # Gerar salt aleatório
     salt = secrets.token_hex(16)
+    
+    # Hash da senha
     hashed_password = hash_password(admin_data.password, salt)
     
-    admin = await db.admin.create(
-        data={
-            "username": admin_data.username,
-            "password": hashed_password,
-            "salt": salt,
-            "role": admin_data.role
-        }
-    )
-    
-    # Auditar
-    await db.auditlog.create(
-        data={
-            "adminId": admin.id,
-            "action": "admin_created",
-            "entity": "admin",
-            "entityId": admin.id,
-            "details": f"Admin '{admin.username}' criado com role '{admin.role}'"
-        }
-    )
-    
-    return admin
+    try:
+        # Criar admin no banco
+        new_admin = await db.admin.create(
+            data={
+                "username": admin_data.username,
+                "password": hashed_password,
+                "salt": salt,
+                "active": True
+            }
+        )
+        
+        print(f"✅ Admin cadastrado: {new_admin.username} (ID: {new_admin.id})")
+        
+        return new_admin
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao cadastrar admin: {str(e)}"
+        )
 
 
-@router.post("/login", response_model=TokenResponse)
-async def login(credentials: AdminLogin, db = Depends(get_db)):
+# ==================== LOGIN ====================
+
+@router.post("/login", response_model=LoginResponse)
+async def login_admin(credentials: AdminLogin, response: Response, db = Depends(get_db)):
     """
-    Login de admin - retorna token JWT
-    """
-    # Buscar admin
-    admin = await db.admin.find_first(where={"username": credentials.username})
+    Realiza login de administrador
     
+    **Fluxo:**
+    1. Busca admin por username
+    2. Verifica se admin existe e está ativo
+    3. Compara senha fornecida com hash armazenado
+    4. Atualiza data de último login
+    5. Retorna dados do admin
+    
+    **Retorna:**
+    - success: True se login bem-sucedido
+    - message: Mensagem de sucesso
+    - admin: Dados do administrador
+    """
+    # Buscar admin por username
+    admin = await db.admin.find_first(
+        where={"username": credentials.username}
+    )
+    
+    # Verificar se admin existe
     if not admin:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciais inválidas"
+            detail="Usuário ou senha incorretos"
         )
     
-    # Verificar senha
-    hashed_input = hash_password(credentials.password, admin.salt)
-    
-    if hashed_input != admin.password:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciais inválidas"
-        )
-    
-    # Verificar se está ativo
+    # Verificar se admin está ativo
     if not admin.active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin inativo"
+            detail="Conta desativada. Entre em contato com o administrador."
+        )
+    
+    # Verificar senha
+    if not verify_password(credentials.password, admin.password, admin.salt):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuário ou senha incorretos"
         )
     
     # Atualizar último login
-    await db.admin.update(
-        where={"id": admin.id},
-        data={"lastLogin": datetime.now()}
+    try:
+        admin = await db.admin.update(
+            where={"id": admin.id},
+            data={"lastLogin": datetime.now()}
+        )
+    except Exception as e:
+        print(f"⚠️  Erro ao atualizar lastLogin: {e}")
+    
+    print(f"✅ Login bem-sucedido: {admin.username}")
+    
+    # Criar cookie de sessão simples (opcional)
+    response.set_cookie(
+        key="admin_id",
+        value=str(admin.id),
+        httponly=True,
+        max_age=28800,  # 8 horas
+        samesite="lax"
     )
     
-    # Criar token
-    token = create_access_token({
-        "admin_id": admin.id,
-        "username": admin.username,
-        "role": admin.role
-    })
-    
-    # Auditar
-    await db.auditlog.create(
-        data={
-            "adminId": admin.id,
-            "action": "login_success",
-            "entity": "admin",
-            "entityId": admin.id,
-            "details": f"Admin '{admin.username}' fez login"
-        }
-    )
-    
-    return TokenResponse(
-        access_token=token,
+    return LoginResponse(
+        success=True,
+        message=f"Bem-vindo, {admin.username}!",
         admin=admin
     )
 
 
-@router.get("/me", response_model=AdminResponse)
-async def get_current_admin_info(admin = Depends(get_current_admin)):
+# ==================== LOGOUT ====================
+
+@router.post("/logout", response_model=LogoutResponse)
+async def logout_admin(response: Response):
     """
-    Retorna informações do admin autenticado
+    Realiza logout (remove cookie de sessão)
     """
-    return admin
+    response.delete_cookie(key="admin_id")
+    
+    return LogoutResponse(
+        success=True,
+        message="Logout realizado com sucesso"
+    )
 
 
-@router.post("/logout")
-async def logout(admin = Depends(get_current_admin), db = Depends(get_db)):
+# ==================== VERIFICAR SESSÃO ====================
+
+@router.get("/verificar")
+async def verificar_sessao(admin_id: int, db = Depends(get_db)):
     """
-    Logout (apenas registra no audit, token expira sozinho)
+    Verifica se uma sessão é válida
+    
+    **Uso:**
+    - Frontend pode chamar para verificar se admin ainda está logado
+    - Passar admin_id obtido do cookie ou storage
+    
+    **Query Parameters:**
+    - admin_id: ID do admin a verificar
     """
-    await db.auditlog.create(
-        data={
-            "adminId": admin.id,
-            "action": "logout",
-            "entity": "admin",
-            "entityId": admin.id,
-            "details": f"Admin '{admin.username}' fez logout"
-        }
+    admin = await db.admin.find_unique(
+        where={"id": admin_id}
     )
     
-    return {"message": "Logout realizado com sucesso"}
-
-
-@router.get("/admins", response_model=list[AdminResponse])
-async def list_admins(
-    admin = Depends(get_current_admin),
-    db = Depends(get_db)
-):
-    """
-    Lista todos os admins (apenas para role 'admin')
-    """
-    if admin.role != "admin":
+    if not admin or not admin.active:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Apenas admins podem listar outros admins"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Sessão inválida ou expirada"
         )
     
-    admins = await db.admin.find_many(order_by={"username": "asc"})
+    return {
+        "valid": True,
+        "admin": AdminResponse.model_validate(admin)
+    }
+
+
+# ==================== LISTAR ADMINS (Protegido) ====================
+
+@router.get("/admins", response_model=list[AdminResponse])
+async def listar_admins(db = Depends(get_db)):
+    """
+    Lista todos os administradores cadastrados
+    
+    **Nota:** Em produção, esta rota deveria ser protegida
+    e acessível apenas por admin master
+    """
+    admins = await db.admin.find_many(
+        order_by={"username": "asc"}
+    )
+    
     return admins
 
 
-@router.patch("/admins/{admin_id}/toggle-active")
-async def toggle_admin_active(
-    admin_id: int,
-    admin = Depends(get_current_admin),
-    db = Depends(get_db)
-):
+# ==================== DESATIVAR ADMIN ====================
+
+@router.patch("/admins/{admin_id}/desativar")
+async def desativar_admin(admin_id: int, db = Depends(get_db)):
     """
-    Ativa/desativa um admin
-    """
-    if admin.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Apenas admins podem modificar outros admins"
-        )
+    Desativa um administrador (não deleta, apenas inativa)
     
-    target_admin = await db.admin.find_unique(where={"id": admin_id})
-    if not target_admin:
+    **Uso:**
+    - Para remover acesso sem perder histórico
+    - Admin pode ser reativado depois
+    """
+    admin = await db.admin.find_unique(where={"id": admin_id})
+    
+    if not admin:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Admin não encontrado"
         )
     
-    # Não pode desativar a si mesmo
-    if admin_id == admin.id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Não é possível desativar sua própria conta"
-        )
-    
-    # Toggle
+    # Toggle active status
     updated = await db.admin.update(
         where={"id": admin_id},
-        data={"active": not target_admin.active}
+        data={"active": not admin.active}
     )
     
-    # Auditar
-    await db.auditlog.create(
-        data={
-            "adminId": admin.id,
-            "action": "admin_toggled",
-            "entity": "admin",
-            "entityId": admin_id,
-            "details": f"Admin '{target_admin.username}' {'ativado' if updated.active else 'desativado'}"
-        }
-    )
+    status_text = "ativado" if updated.active else "desativado"
     
     return {
         "success": True,
-        "admin": updated,
-        "message": f"Admin {'ativado' if updated.active else 'desativado'} com sucesso"
+        "message": f"Admin '{updated.username}' foi {status_text}",
+        "admin": updated
+    }
+
+
+# ==================== ALTERAR SENHA ====================
+
+@router.post("/alterar-senha")
+async def alterar_senha(
+    admin_id: int,
+    senha_atual: str,
+    senha_nova: str,
+    db = Depends(get_db)
+):
+    """
+    Altera a senha de um administrador
+    
+    **Validações:**
+    - Senha atual deve estar correta
+    - Senha nova deve ter mínimo 6 caracteres
+    """
+    # Buscar admin
+    admin = await db.admin.find_unique(where={"id": admin_id})
+    
+    if not admin:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Admin não encontrado"
+        )
+    
+    # Verificar senha atual
+    if not verify_password(senha_atual, admin.password, admin.salt):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Senha atual incorreta"
+        )
+    
+    # Validar senha nova
+    if len(senha_nova) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Senha nova deve ter no mínimo 6 caracteres"
+        )
+    
+    # Gerar novo salt e hash
+    new_salt = secrets.token_hex(16)
+    new_hashed = hash_password(senha_nova, new_salt)
+    
+    # Atualizar no banco
+    await db.admin.update(
+        where={"id": admin_id},
+        data={
+            "password": new_hashed,
+            "salt": new_salt
+        }
+    )
+    
+    print(f"✅ Senha alterada: {admin.username}")
+    
+    return {
+        "success": True,
+        "message": "Senha alterada com sucesso"
     }

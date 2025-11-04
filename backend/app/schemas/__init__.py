@@ -1,5 +1,5 @@
 # Import schemas from acess_rule.py
-from .acess_rule import (
+from .access_rule import (
     AccessRuleBase,
     AccessRuleCreate,
     AccessRuleUpdate,

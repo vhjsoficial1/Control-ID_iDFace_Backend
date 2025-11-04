@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import connect_db, disconnect_db
-from app.routers import users, access_rules, time_zones, audit, sync, system, backup, report, realtime, capture
+from app.routers import users, access_rules, time_zones, audit, sync, system, backup, report, realtime, capture, auth
 
 
 app = FastAPI(
@@ -49,3 +49,4 @@ app.include_router(backup.router, prefix="/api/v1/backup", tags=["Backup"])
 app.include_router(report.router, prefix="/api/v1/report", tags=["Report"])
 app.include_router(realtime.router, prefix="/api/v1/realtime", tags=["Realtime Monitoring"])
 app.include_router(capture.router, prefix="/api/v1/capture", tags=["Face Capture"])
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])

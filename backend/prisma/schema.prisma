@@ -9,20 +9,33 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Usuário (Funcionário)
+// ==================== ADMIN (Sistema de Login) ====================
+model Admin {
+  id        Int      @id @default(autoincrement())
+  username  String   @unique
+  password  String   // Hash SHA256
+  salt      String   // Salt para segurança
+  active    Boolean  @default(true)
+  
+  createdAt DateTime @default(now())
+  lastLogin DateTime?
+  
+  @@map("admins")
+}
+
+// ==================== USUÁRIOS (Funcionários) ====================
 model User {
   id              Int       @id @default(autoincrement())
-  idFaceId        Int?      @unique // ID no sistema iDFace
+  idFaceId        Int?      @unique
   name            String
-  registration    String?   @unique // Matrícula
-  password        String?   // Senha (hashed)
-  salt            String?   // Salt para senha
-  beginTime       DateTime? // Data início validade
-  endTime         DateTime? // Data fim validade
-  image           String?   // Base64 da imagem facial
+  registration    String?   @unique
+  password        String?
+  salt            String?
+  beginTime       DateTime?
+  endTime         DateTime?
+  image           String?
   imageTimestamp  DateTime?
   
-  // Relacionamentos
   cards           Card[]
   qrcodes         QRCode[]
   templates       Template[]
@@ -39,7 +52,7 @@ model User {
 // Cartões de acesso
 model Card {
   id        Int      @id @default(autoincrement())
-  value     BigInt   @unique // Número do cartão
+  value     BigInt   @unique
   userId    Int
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   
@@ -64,7 +77,7 @@ model QRCode {
 model Template {
   id         Int    @id @default(autoincrement())
   fingerType Int    @default(0)
-  template   String // Base64 do template
+  template   String
   userId     Int
   user       User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   
@@ -80,9 +93,8 @@ model AccessRule {
   type     Int    @default(1)
   priority Int    @default(0)
   
-  idFaceId Int?   @unique // ID no iDFace
+  idFaceId Int?   @unique
   
-  // Relacionamentos
   timeZones           AccessRuleTimeZone[]
   userAccessRules     UserAccessRule[]
   groupAccessRules    GroupAccessRule[]
@@ -101,7 +113,6 @@ model TimeZone {
   
   idFaceId  Int?     @unique
   
-  // Relacionamentos
   timeSpans           TimeSpan[]
   accessRuleTimeZones AccessRuleTimeZone[]
   
@@ -117,10 +128,9 @@ model TimeSpan {
   timeZoneId Int
   timeZone   TimeZone @relation(fields: [timeZoneId], references: [id], onDelete: Cascade)
   
-  start Int // Segundos desde meia-noite
-  end   Int // Segundos desde meia-noite
+  start Int
+  end   Int
   
-  // Dias da semana (0 = não, 1 = sim)
   sun Boolean @default(false)
   mon Boolean @default(false)
   tue Boolean @default(false)
@@ -129,7 +139,6 @@ model TimeSpan {
   fri Boolean @default(false)
   sat Boolean @default(false)
   
-  // Feriados
   hol1 Boolean @default(false)
   hol2 Boolean @default(false)
   hol3 Boolean @default(false)
@@ -159,7 +168,6 @@ model Group {
   
   idFaceId Int?   @unique
   
-  // Relacionamentos
   userGroups       UserGroup[]
   groupAccessRules GroupAccessRule[]
   
@@ -215,7 +223,6 @@ model Portal {
   
   idFaceId Int? @unique
   
-  // Relacionamentos
   portalAccessRules PortalAccessRule[]
   accessLogs        AccessLog[]
   
@@ -247,9 +254,9 @@ model AccessLog {
   portalId  Int?
   portal    Portal?  @relation(fields: [portalId], references: [id], onDelete: SetNull)
   
-  event     String   // "access_granted", "access_denied", "unknown_user"
-  reason    String?  // Motivo da negação
-  cardValue String?  // Número do cartão usado
+  event     String
+  reason    String?
+  cardValue String?
   
   timestamp DateTime @default(now())
   
@@ -262,9 +269,8 @@ model Position {
   name        String @unique
   description String?
   
-  // Horário padrão do cargo
-  defaultStartTime String? // "08:00"
-  defaultEndTime   String? // "17:00"
+  defaultStartTime String?
+  defaultEndTime   String?
   
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

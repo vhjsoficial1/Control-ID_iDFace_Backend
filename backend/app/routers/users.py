@@ -164,6 +164,14 @@ async def update_user(user_id: int, user_data: UserUpdate, db = Depends(get_db))
         data=update_data
     )
     
+    # Sincronizar com o iDFace
+    try:
+        sync_service = SyncService(db)
+        await sync_service.sync_user_to_idface(user_id)
+    except Exception as e:
+        # Opcional: logar o erro de sincronização, mas não falhar a requisição
+        print(f"AVISO: Usuário {user_id} atualizado localmente, mas falha ao sincronizar com o iDFace: {str(e)}")
+
     return updated_user
 
 
@@ -179,6 +187,15 @@ async def delete_user(user_id: int, db = Depends(get_db)):
             detail=f"Usuário {user_id} não encontrado"
         )
     
+    # Sincronizar deleção com o iDFace
+    if existing.idFaceId:
+        try:
+            async with idface_client:
+                await idface_client.delete_user(existing.idFaceId)
+        except Exception as e:
+            # Opcional: logar o erro, mas continuar com a deleção local
+            print(f"AVISO: Falha ao deletar usuário {user_id} do iDFace: {str(e)}")
+
     await db.user.delete(where={"id": user_id})
 
 

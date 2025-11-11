@@ -31,9 +31,10 @@ class SyncService:
         sync_access_rules: bool = True
     ) -> Dict[str, Any]:
         """
-        Sincroniza um usuário específico para o iDFace
+        Sincroniza um usuário específico para o iDFace, incluindo regras de acesso
+        diretas e de grupos.
         """
-        # Buscar usuário completo
+        # Buscar usuário completo com todas as associações necessárias
         user = await self.db.user.find_unique(
             where={"id": user_id},
             include={
@@ -41,20 +42,31 @@ class SyncService:
                 "qrcodes": True,
                 "userAccessRules": {
                     "include": {"accessRule": True}
+                },
+                "userGroups": {
+                    "include": {
+                        "group": {
+                            "include": {
+                                "groupAccessRules": {
+                                    "include": {"accessRule": True}
+                                }
+                            }
+                        }
+                    }
                 }
             }
         )
-        
+
         if not user:
             raise ValueError(f"Usuário {user_id} não encontrado")
-        
+
         result = {
             "userId": user_id,
             "userName": user.name,
             "steps": [],
             "success": True
         }
-        
+
         try:
             async with idface_client:
                 # 1. Criar/atualizar usuário
@@ -64,16 +76,21 @@ class SyncService:
                     "password": user.password or "",
                     "salt": user.salt or ""
                 }
-                
+
                 if user.idFaceId:
                     # Atualizar existente
                     await idface_client.update_user(user.idFaceId, user_data)
                     idface_user_id = user.idFaceId
                     result["steps"].append("Usuário atualizado no iDFace")
                 else:
-                    # Criar novo
-                    response = await idface_client.create_user(user_data)
-                    idface_user_id = response.get("id")
+                    # Criar novo e buscar ID
+                    await idface_client.create_user(user_data)
+                    search_result = await idface_client.load_users(where={"users": {"registration": user.registration}})
+                    idface_users = search_result.get("users", [])
+                    if not idface_users:
+                        raise ValueError("Usuário não encontrado no leitor após criação")
+                    
+                    idface_user_id = idface_users[0]["id"]
                     
                     # Salvar ID do iDFace
                     await self.db.user.update(
@@ -81,9 +98,9 @@ class SyncService:
                         data={"idFaceId": idface_user_id}
                     )
                     result["steps"].append("Usuário criado no iDFace")
-                
+
                 result["idFaceId"] = idface_user_id
-                
+
                 # 2. Sincronizar imagem facial
                 if sync_image and user.image:
                     try:
@@ -97,43 +114,67 @@ class SyncService:
                     except Exception as e:
                         result["steps"].append(f"Erro ao sincronizar imagem: {str(e)}")
                         logger.error(f"Erro ao sincronizar imagem do usuário {user_id}: {e}")
-                
-                # 3. Sincronizar cartões
-                if sync_cards and user.cards:
+
+                # 3. Sincronizar cartões (com limpeza prévia)
+                if sync_cards:
+                    # Limpar cartões existentes no iDFace para este usuário
+                    await idface_client.request(
+                        "POST", "destroy_objects.fcgi",
+                        json={"object": "cards", "where": {"cards": {"user_id": idface_user_id}}}
+                    )
+                    
                     synced_cards = 0
-                    for card in user.cards:
-                        try:
-                            await idface_client.create_card(
-                                int(card.value),
-                                idface_user_id
-                            )
-                            synced_cards += 1
-                        except Exception as e:
-                            logger.error(f"Erro ao sincronizar cartão {card.id}: {e}")
-                    
-                    result["steps"].append(f"{synced_cards}/{len(user.cards)} cartões sincronizados")
-                
-                # 4. Sincronizar regras de acesso
-                if sync_access_rules and user.userAccessRules:
-                    synced_rules = 0
-                    for uar in user.userAccessRules:
-                        if uar.accessRule.idFaceId:
+                    if user.cards:
+                        for card in user.cards:
                             try:
-                                await idface_client.create_user_access_rule(
-                                    idface_user_id,
-                                    uar.accessRule.idFaceId
-                                )
-                                synced_rules += 1
+                                # O valor do cartão deve ser um inteiro
+                                card_value = int(card.value)
+                                await idface_client.create_card(card_value, idface_user_id)
+                                synced_cards += 1
                             except Exception as e:
-                                logger.error(f"Erro ao vincular regra {uar.accessRuleId}: {e}")
+                                logger.error(f"Erro ao sincronizar cartão {card.id} para usuário {user_id}: {e}")
+                    result["steps"].append(f"{synced_cards} cartões sincronizados")
+
+                # 4. Sincronizar regras de acesso (lógica aprimorada)
+                if sync_access_rules:
+                    all_rule_ids = set()
+
+                    # Regras diretas
+                    if user.userAccessRules:
+                        for uar in user.userAccessRules:
+                            if uar.accessRule and uar.accessRule.idFaceId:
+                                all_rule_ids.add(uar.accessRule.idFaceId)
+
+                    # Regras de grupos
+                    if user.userGroups:
+                        for ug in user.userGroups:
+                            if ug.group and ug.group.groupAccessRules:
+                                for gar in ug.group.groupAccessRules:
+                                    if gar.accessRule and gar.accessRule.idFaceId:
+                                        all_rule_ids.add(gar.accessRule.idFaceId)
                     
-                    result["steps"].append(f"{synced_rules}/{len(user.userAccessRules)} regras vinculadas")
-                
+                    # Limpar regras de acesso existentes no iDFace para este usuário
+                    await idface_client.request(
+                        "POST", "destroy_objects.fcgi",
+                        json={"object": "user_access_rules", "where": {"user_access_rules": {"user_id": idface_user_id}}}
+                    )
+
+                    # Criar as novas regras de acesso
+                    synced_rules = 0
+                    for rule_id_face in all_rule_ids:
+                        try:
+                            await idface_client.create_user_access_rule(idface_user_id, rule_id_face)
+                            synced_rules += 1
+                        except Exception as e:
+                            logger.error(f"Erro ao vincular regra {rule_id_face} ao usuário {idface_user_id}: {e}")
+                    
+                    result["steps"].append(f"{synced_rules}/{len(all_rule_ids)} regras de acesso vinculadas")
+
         except Exception as e:
             result["success"] = False
             result["error"] = str(e)
-            logger.error(f"Erro ao sincronizar usuário {user_id}: {e}")
-        
+            logger.error(f"Erro fatal ao sincronizar usuário {user_id}: {e}")
+
         return result
     
     async def sync_user_from_idface(self, idface_user_id: int) -> Dict[str, Any]:

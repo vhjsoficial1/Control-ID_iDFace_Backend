@@ -768,6 +768,24 @@ async def add_user_to_group(group_id: int, user_id: int, db = Depends(get_db)):
     await db.usergroup.create(
         data={"userId": user_id, "groupId": group_id}
     )
+
+    # Sincronizar com iDFace
+    if group.idFaceId and user.idFaceId:
+        try:
+            async with idface_client:
+                await idface_client.request(
+                    "POST",
+                    "create_objects.fcgi",
+                    json={
+                        "object": "user_groups",
+                        "values": [{
+                            "user_id": user.idFaceId,
+                            "group_id": group.idFaceId
+                        }]
+                    }
+                )
+        except Exception as e:
+            print(f"Aviso: Erro ao sincronizar vínculo de usuário com grupo no iDFace: {e}")
     
     return {"success": True, "message": f"Usuário '{user.name}' adicionado ao grupo '{group.name}'"}
 
@@ -778,12 +796,35 @@ async def remove_user_from_group(group_id: int, user_id: int, db = Depends(get_d
     Remove usuário de um grupo
     """
     link = await db.usergroup.find_first(
-        where={"userId": user_id, "groupId": group_id}
+        where={"userId": user_id, "groupId": group_id},
+        include={"user": True, "group": True}
     )
     
     if not link:
         raise HTTPException(status_code=404, detail="Usuário não pertence a este grupo")
+
+    # Deletar do iDFace primeiro
+    if link.group and link.group.idFaceId and link.user and link.user.idFaceId:
+        try:
+            async with idface_client:
+                await idface_client.request(
+                    "POST",
+                    "destroy_objects.fcgi",
+                    json={
+                        "object": "user_groups",
+                        "where": {
+                            "user_groups": {
+                                "user_id": link.user.idFaceId,
+                                "group_id": link.group.idFaceId
+                            }
+                        }
+                    }
+                )
+        except Exception as e:
+            # Log o erro mas não impede a deleção local
+            print(f"Aviso: Erro ao remover vínculo de usuário do grupo no iDFace: {e}")
     
+    # Deletar do banco local
     await db.usergroup.delete(where={"id": link.id})
 
 
@@ -897,6 +938,202 @@ async def sync_rule_to_idface(rule_id: int, db = Depends(get_db)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erro ao sincronizar: {str(e)}"
         )
+
+# ==================== Direct Time Zone Association ====================
+
+@router.post("/groups/{group_id}/time-zones/{tz_id}", status_code=status.HTTP_201_CREATED)
+async def link_time_zone_to_group(group_id: int, tz_id: int, db = Depends(get_db)):
+    """
+    Associa um Time Zone (horário) a um Group (departamento).
+    Internamente, encontra ou cria uma regra de acesso para o grupo e a vincula ao time zone.
+    """
+    group = await db.group.find_unique(where={"id": group_id})
+    if not group or not group.idFaceId:
+        raise HTTPException(status_code=404, detail="Grupo não encontrado ou não sincronizado.")
+
+    time_zone = await db.timezone.find_unique(where={"id": tz_id})
+    if not time_zone or not time_zone.idFaceId:
+        raise HTTPException(status_code=404, detail="Time Zone não encontrado ou não sincronizado.")
+
+    # Encontrar ou criar a regra de acesso para o grupo
+    rule_name = f"Regra para Grupo: {group.name}"
+    group_rule_link = await db.groupaccessrule.find_first(
+        where={"groupId": group_id},
+        include={"accessRule": True}
+    )
+
+    access_rule = None
+    if group_rule_link:
+        access_rule = group_rule_link.accessRule
+    else:
+        try:
+            # Cria a regra de acesso
+            access_rule = await db.accessrule.create(data={"name": rule_name, "type": 1, "priority": 10}) # Prioridade alta para grupos
+            async with idface_client:
+                # Sincroniza
+                res = await idface_client.create_access_rule({"name": rule_name, "type": 1, "priority": 10})
+                rule_idface_id = res['ids'][0]
+                access_rule = await db.accessrule.update(where={"id": access_rule.id}, data={"idFaceId": rule_idface_id})
+                
+                # Vincula grupo à regra
+                await db.groupaccessrule.create(data={"groupId": group.id, "accessRuleId": access_rule.id})
+                await idface_client.request("POST", "create_objects.fcgi", json={
+                    "object": "group_access_rules", "values": [{"group_id": group.idFaceId, "access_rule_id": rule_idface_id}]
+                })
+        except Exception as e:
+            if access_rule and access_rule.id:
+                await db.accessrule.delete(where={"id": access_rule.id})
+            raise HTTPException(status_code=500, detail=f"Erro ao criar/sincronizar regra para grupo: {e}")
+
+    # Vincular o time zone à regra de acesso
+    existing_link = await db.accessruletimezone.find_first(where={"accessRuleId": access_rule.id, "timeZoneId": tz_id})
+    if existing_link:
+        return {"success": True, "message": "Associação já existe."}
+
+    await db.accessruletimezone.create(data={"accessRuleId": access_rule.id, "timeZoneId": tz_id})
+    try:
+        async with idface_client:
+            await idface_client.request("POST", "create_objects.fcgi", json={
+                "object": "access_rule_time_zones", "values": [{"access_rule_id": access_rule.idFaceId, "time_zone_id": time_zone.idFaceId}]
+            })
+    except Exception as e:
+        # Idealmente, faria rollback do accessruletimezone.create
+        raise HTTPException(status_code=500, detail=f"Erro ao sincronizar time zone com regra: {e}")
+
+    return {"success": True, "message": f"Time Zone '{time_zone.name}' associado ao Grupo '{group.name}'."}
+
+
+@router.delete("/groups/{group_id}/time-zones/{tz_id}", status_code=status.HTTP_200_OK)
+async def unlink_time_zone_from_group(group_id: int, tz_id: int, db = Depends(get_db)):
+    """
+    Desassocia um Time Zone de um Group, procurando em todas as regras do grupo.
+    """
+    group_rule_links = await db.groupaccessrule.find_many(where={"groupId": group_id})
+    if not group_rule_links:
+        raise HTTPException(status_code=404, detail="Nenhuma regra de acesso encontrada para este grupo.")
+
+    rule_ids = [link.accessRuleId for link in group_rule_links]
+
+    tz_links_to_delete = await db.accessruletimezone.find_many(
+        where={"timeZoneId": tz_id, "accessRuleId": {"in": rule_ids}},
+        include={"accessRule": True, "timeZone": True}
+    )
+
+    if not tz_links_to_delete:
+        raise HTTPException(status_code=404, detail="Associação entre este grupo e time zone não encontrada.")
+
+    deleted_count = 0
+    for link in tz_links_to_delete:
+        if link.accessRule.idFaceId and link.timeZone.idFaceId:
+            try:
+                async with idface_client:
+                    await idface_client.request("POST", "destroy_objects.fcgi", json={
+                        "object": "access_rule_time_zones",
+                        "where": {"access_rule_time_zones": {"access_rule_id": link.accessRule.idFaceId, "time_zone_id": link.timeZone.idFaceId}}
+                    })
+            except Exception as e:
+                print(f"Aviso: Falha ao deletar vínculo no iDFace: {e}")
+        
+        await db.accessruletimezone.delete(where={"id": link.id})
+        deleted_count += 1
+    
+    return {"success": True, "message": f"{deleted_count} associação(ões) removida(s)."}
+
+
+@router.post("/users/{user_id}/time-zones/{tz_id}", status_code=status.HTTP_201_CREATED)
+async def link_time_zone_to_user(user_id: int, tz_id: int, db = Depends(get_db)):
+    """
+    Associa um Time Zone diretamente a um User.
+    Cria uma regra de acesso individual para o usuário se necessário.
+    """
+    user = await db.user.find_unique(where={"id": user_id})
+    if not user or not user.idFaceId:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado ou não sincronizado.")
+
+    time_zone = await db.timezone.find_unique(where={"id": tz_id})
+    if not time_zone or not time_zone.idFaceId:
+        raise HTTPException(status_code=404, detail="Time Zone não encontrado ou não sincronizado.")
+
+    # Encontrar ou criar a regra de acesso para o usuário
+    rule_name = f"Regra Individual para: {user.name} (id: {user.id})"
+    user_rule_link = await db.useraccessrule.find_first(
+        where={"userId": user_id, "accessRule": {"name": rule_name}},
+        include={"accessRule": True}
+    )
+
+    access_rule = None
+    if user_rule_link:
+        access_rule = user_rule_link.accessRule
+    else:
+        try:
+            access_rule = await db.accessrule.create(data={"name": rule_name, "type": 1, "priority": 5}) # Prioridade média
+            async with idface_client:
+                res = await idface_client.create_access_rule({"name": rule_name, "type": 1, "priority": 5})
+                rule_idface_id = res['ids'][0]
+                access_rule = await db.accessrule.update(where={"id": access_rule.id}, data={"idFaceId": rule_idface_id})
+                
+                await db.useraccessrule.create(data={"userId": user.id, "accessRuleId": access_rule.id})
+                await idface_client.request("POST", "create_objects.fcgi", json={
+                    "object": "user_access_rules", "values": [{"user_id": user.idFaceId, "access_rule_id": rule_idface_id}]
+                })
+        except Exception as e:
+            if access_rule and access_rule.id:
+                await db.accessrule.delete(where={"id": access_rule.id})
+            raise HTTPException(status_code=500, detail=f"Erro ao criar/sincronizar regra para usuário: {e}")
+
+    # Vincular o time zone à regra
+    existing_link = await db.accessruletimezone.find_first(where={"accessRuleId": access_rule.id, "timeZoneId": tz_id})
+    if existing_link:
+        return {"success": True, "message": "Associação já existe."}
+
+    await db.accessruletimezone.create(data={"accessRuleId": access_rule.id, "timeZoneId": tz_id})
+    try:
+        async with idface_client:
+            await idface_client.request("POST", "create_objects.fcgi", json={
+                "object": "access_rule_time_zones", "values": [{"access_rule_id": access_rule.idFaceId, "time_zone_id": time_zone.idFaceId}]
+            })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao sincronizar time zone com regra: {e}")
+
+    return {"success": True, "message": f"Time Zone '{time_zone.name}' associado ao Usuário '{user.name}'."}
+
+
+@router.delete("/users/{user_id}/time-zones/{tz_id}", status_code=status.HTTP_200_OK)
+async def unlink_time_zone_from_user(user_id: int, tz_id: int, db = Depends(get_db)):
+    """
+    Desassocia um Time Zone de um User, procurando em todas as regras vinculadas ao usuário.
+    """
+    user_rule_links = await db.useraccessrule.find_many(where={"userId": user_id})
+    if not user_rule_links:
+        raise HTTPException(status_code=404, detail="Usuário não vinculado a nenhuma regra de acesso.")
+
+    rule_ids = [link.accessRuleId for link in user_rule_links]
+    
+    tz_links_to_delete = await db.accessruletimezone.find_many(
+        where={"timeZoneId": tz_id, "accessRuleId": {"in": rule_ids}},
+        include={"accessRule": True, "timeZone": True}
+    )
+
+    if not tz_links_to_delete:
+        raise HTTPException(status_code=404, detail="Associação entre este usuário e time zone não encontrada.")
+
+    deleted_count = 0
+    for link in tz_links_to_delete:
+        if link.accessRule.idFaceId and link.timeZone.idFaceId:
+            try:
+                async with idface_client:
+                    await idface_client.request("POST", "destroy_objects.fcgi", json={
+                        "object": "access_rule_time_zones",
+                        "where": {"access_rule_time_zones": {"access_rule_id": link.accessRule.idFaceId, "time_zone_id": link.timeZone.idFaceId}}
+                    })
+            except Exception as e:
+                print(f"Aviso: Falha ao deletar vínculo no iDFace: {e}")
+        
+        await db.accessruletimezone.delete(where={"id": link.id})
+        deleted_count += 1
+    
+    return {"success": True, "message": f"{deleted_count} associação(ões) removida(s)."}
+
 
 # ==================== User-Rule Management ====================
 

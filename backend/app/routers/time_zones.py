@@ -115,46 +115,86 @@ async def create_time_zone(
     db = Depends(get_db)
 ):
     """
-    Cria um novo time zone no banco local
+    Cria um novo time zone no banco local e sincroniza com o iDFace.
+    Se a sincronização com o iDFace falhar, a criação local é desfeita.
     """
+    # Inicia a transação
+    new_tz = None
     try:
-        # Criar time zone
-        new_tz = await db.timezone.create(
-            data={
-                "name": time_zone.name
-            }
-        )
-        
-        # Se houver time spans, criar também
-        if time_zone.timeSpans:
-            for span in time_zone.timeSpans:
-                await db.timespan.create(
-                    data={
-                        "timeZoneId": new_tz.id,
-                        "start": span.start,
-                        "end": span.end,
-                        "sun": span.sun,
-                        "mon": span.mon,
-                        "tue": span.tue,
-                        "wed": span.wed,
-                        "thu": span.thu,
-                        "fri": span.fri,
-                        "sat": span.sat,
-                        "hol1": span.hol1,
-                        "hol2": span.hol2,
-                        "hol3": span.hol3
-                    }
+        # 1. Criar time zone no banco de dados local
+        new_tz = await db.timezone.create(data={"name": time_zone.name})
+
+        # 2. Sincronizar com o iDFace
+        idface_id = None
+        try:
+            async with idface_client:
+                # Criar o time zone no iDFace
+                tz_payload = {"name": time_zone.name}
+                result_tz = await idface_client.create_time_zone(tz_payload)
+
+                if not result_tz.get("ids"):
+                    raise ValueError("Falha ao obter ID do iDFace para o time zone.")
+                
+                idface_id = result_tz["ids"][0]
+
+                # Atualizar o time zone local com o idFaceId
+                await db.timezone.update(
+                    where={"id": new_tz.id},
+                    data={"idFaceId": idface_id}
                 )
-        
-        # Recarregar com time spans
+
+                # 3. Criar e sincronizar time spans, se houver
+                if time_zone.timeSpans:
+                    for span_data in time_zone.timeSpans:
+                        # Criar no banco local
+                        await db.timespan.create(
+                            data={
+                                "timeZoneId": new_tz.id,
+                                **span_data.model_dump()
+                            }
+                        )
+                        # Sincronizar com o iDFace
+                        span_payload = {
+                            "time_zone_id": idface_id,
+                            "start": span_data.start,
+                            "end": span_data.end,
+                            "sun": 1 if span_data.sun else 0,
+                            "mon": 1 if span_data.mon else 0,
+                            "tue": 1 if span_data.tue else 0,
+                            "wed": 1 if span_data.wed else 0,
+                            "thu": 1 if span_data.thu else 0,
+                            "fri": 1 if span_data.fri else 0,
+                            "sat": 1 if span_data.sat else 0,
+                            "hol1": 1 if span_data.hol1 else 0,
+                            "hol2": 1 if span_data.hol2 else 0,
+                            "hol3": 1 if span_data.hol3 else 0
+                        }
+                        await idface_client.create_time_span(span_payload)
+
+        except Exception as sync_error:
+            # Se a sincronização falhar, deletar o time zone criado localmente
+            if new_tz:
+                await db.timezone.delete(where={"id": new_tz.id})
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Erro ao sincronizar com iDFace: {str(sync_error)}"
+            )
+
+        # Recarregar com os dados completos para a resposta
         result = await db.timezone.find_unique(
             where={"id": new_tz.id},
             include={"timeSpans": True}
         )
-        
         return result
-        
+
     except Exception as e:
+        # Captura outras exceções que não sejam de sincronização
+        if new_tz and not new_tz.idFaceId:
+             await db.timezone.delete(where={"id": new_tz.id})
+        
+        if isinstance(e, HTTPException):
+            raise e
+            
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Erro ao criar time zone: {str(e)}"

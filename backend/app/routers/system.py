@@ -327,79 +327,82 @@ async def get_time_configuration():
 
 # ==================== Device Actions ====================
 
+class ActionRequest(BaseModel):
+    """Requisição para executar ação no dispositivo"""
+    action: str = Field(..., description="Tipo de ação: door, sec_box, etc")
+    parameters: str = Field(..., description="Parâmetros da ação, ex: 'door=1,timeout=3000'")
+
+
+class ActionResponse(BaseModel):
+    """Resposta de execução de ação"""
+    success: bool
+    action: str
+    message: str
+    executedAt: datetime = Field(default_factory=datetime.now)
+
+
 @router.post("/actions/execute", response_model=ActionResponse)
 async def execute_action(request: ActionRequest):
     """
-    Executa uma ação no dispositivo (abrir porta, ativar alarme, etc)
+    Executa uma ação genérica no dispositivo.
+    Use esta rota para ações que não possuem um atalho específico.
     """
-    valid_actions = [
-        "open_door",
-        "alarm_on", 
-        "alarm_off",
-        "unlock_door",
-        "lock_door"
-    ]
-    
-    if request.action not in valid_actions:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Ação inválida. Ações válidas: {', '.join(valid_actions)}"
-        )
-    
     try:
         async with idface_client:
-            # Montar payload de ação
             action_data = {
-                "action": request.action
+                "action": request.action,
+                "parameters": request.parameters
             }
             
-            if request.portalId:
-                action_data["portal_id"] = request.portalId
-            
-            if request.duration:
-                action_data["duration"] = request.duration
-            
-            if request.parameters:
-                action_data.update(request.parameters)
-            
-            # Executar ação
             result = await idface_client.execute_actions([action_data])
             
+            # A API do iDFace retorna uma lista de ações com status
+            if result and "actions" in result and result["actions"]:
+                action_result = result["actions"][0]
+                if action_result.get("status") == "allowed":
+                    return ActionResponse(
+                        success=True,
+                        action=request.action,
+                        message=f"Ação '{request.action}' executada com sucesso."
+                    )
+                else:
+                    return ActionResponse(
+                        success=False,
+                        action=request.action,
+                        message=f"Ação '{request.action}' negada pelo dispositivo. Status: {action_result.get('status')}"
+                    )
+            
             return ActionResponse(
-                success=True,
+                success=False,
                 action=request.action,
-                message=f"Ação '{request.action}' executada com sucesso"
+                message=f"Resposta inesperada do dispositivo: {result}"
             )
             
     except Exception as e:
-        return ActionResponse(
-            success=False,
-            action=request.action,
-            message=f"Erro ao executar ação: {str(e)}"
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao executar ação: {str(e)}"
         )
 
 
-@router.post("/actions/open-door")
-async def open_door(portalId: Optional[int] = None, duration: int = 5):
+@router.post("/actions/open-secbox", response_model=ActionResponse)
+async def open_secbox(secbox_id: int = 65793, reason: int = 3, timeout: int = 3):
     """
-    Atalho para abrir porta
+    Aciona um sec_box (relé), geralmente para abrir uma porta.
+    - **secbox_id**: ID do sec_box a ser acionado (padrão: 65793).
+    - **reason**: Motivo do acionamento (padrão: 3).
+    - **timeout**: Duração em segundos para manter o relé acionado (padrão: 3).
+                   Use 0 para manter acionado indefinidamente.
     """
-    request = ActionRequest(
-        action="open_door",
-        portalId=portalId,
-        duration=duration
-    )
-    return await execute_action(request)
-
-
-@router.post("/actions/alarm")
-async def control_alarm(enable: bool = True):
-    """
-    Atalho para controlar alarme
-    """
-    request = ActionRequest(
-        action="alarm_on" if enable else "alarm_off"
-    )
+    # Constrói a string de parâmetros
+    params = f"id={secbox_id},reason={reason}"
+    if timeout >= 0:
+        # O timeout é em milissegundos
+        params += f",timeout={timeout * 1000}"
+        
+    # Cria a requisição e chama o endpoint genérico
+    request = ActionRequest(action="sec_box", parameters=params)
+    
     return await execute_action(request)
 
 

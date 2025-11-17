@@ -10,6 +10,8 @@ from app.services.sync_service import SyncService
 from app.utils.idface_client import idface_client
 from typing import Optional
 import base64
+import asyncio
+from datetime import datetime
 
 router = APIRouter()
 
@@ -24,21 +26,28 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
     2. Sincroniza com o leitor
     3. Busca o ID correto no leitor
     4. Atualiza o banco local com o ID do leitor
+    5. Envia a imagem se fornecida
     """
     user_service = UserService(db)
-    sync_service = SyncService(db)
-
-    # 1. Criar usuário localmente primeiro
-    create_result = await user_service.create_user(name=user.name,
+    
+    # Guardar imagem temporariamente
+    temp_image = user.image
+    
+    # 1. Criar usuário localmente primeiro (SEM imagem inicialmente)
+    create_result = await user_service.create_user(
+        name=user.name,
         registration=user.registration or None,
         password=user.password,
         begin_time=user.beginTime,
         end_time=user.endTime,
-        image=user.image)
+        image=None  # NÃO salvar imagem ainda
+    )
 
     if not create_result.get("success"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Erro ao criar usuário: {create_result.get('errors', ['Erro desconhecido.'])}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Erro ao criar usuário: {create_result.get('errors', ['Erro desconhecido.'])}"
+        )
 
     new_user = create_result["user"]
     
@@ -46,23 +55,31 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
     try:
         async with idface_client:
             # Criar usuário no leitor
-            idface_data = {"name": new_user.name,
+            idface_data = {
+                "name": new_user.name,
                 "registration": new_user.registration or "",
                 "password": new_user.password or "",
-                "salt": new_user.salt or ""}
+                "salt": new_user.salt or ""
+            }
             
             await idface_client.create_user(idface_data)
             
+            # Aguardar um pouco para o leitor processar
+            await asyncio.sleep(0.5)
+            
             # Buscar usuário no leitor para confirmar os dados
-            search_result = await idface_client.load_users(where={"users": {
-                "name": new_user.name,
-                "registration": new_user.registration}})
+            search_result = await idface_client.load_users(where={
+                "users": {
+                    "name": new_user.name,
+                    "registration": new_user.registration
+                }
+            })
             
             idface_users = search_result.get("users", [])
             if not idface_users:
                 raise ValueError("Usuário não encontrado no leitor após criação")
             
-            # Pegar o primeiro match e atualizar o banco local
+            # Pegar o primeiro match
             idface_user = idface_users[0]
             idface_id = idface_user["id"]
             
@@ -71,6 +88,34 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
                 where={"id": new_user.id},
                 data={"idFaceId": idface_id}
             )
+            
+            # 3. AGORA enviar a imagem se fornecida
+            if temp_image:
+                try:
+                    import base64
+                    image_bytes = base64.b64decode(temp_image)
+                    
+                    # Enviar imagem para o leitor
+                    await idface_client.set_user_image(
+                        idface_id,
+                        image_bytes,
+                        match=True
+                    )
+                    
+                    # Salvar imagem no banco local
+                    new_user = await db.user.update(
+                        where={"id": new_user.id},
+                        data={
+                            "image": temp_image,
+                            "imageTimestamp": datetime.now()
+                        }
+                    )
+                    
+                    print(f"✅ Imagem sincronizada para usuário {new_user.id} (iDFace ID: {idface_id})")
+                    
+                except Exception as img_error:
+                    print(f"⚠️ Erro ao sincronizar imagem: {img_error}")
+                    # Não falhar a criação do usuário por causa da imagem
             
             return new_user
             
@@ -81,12 +126,6 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erro ao sincronizar com o leitor: {str(e)}"
         )
-    except Exception as e:
-        print(f"AVISO: Usuário {new_user.id} criado localmente, mas uma exceção ocorreu durante a sincronização: {str(e)}")
-
-    # 3. Retornar os dados finais do usuário (que pode ter sido atualizado com o idFaceId)
-    final_user = await db.user.find_unique(where={"id": new_user.id})
-    return final_user
 
 
 @router.get("/", response_model=UserListResponse)
@@ -298,7 +337,6 @@ async def upload_user_image(user_id: int, image_data: UserImageUpload, db = Depe
         )
     
     # Salvar imagem no banco de dados
-    from datetime import datetime
     await db.user.update(
         where={"id": user_id},
         data={

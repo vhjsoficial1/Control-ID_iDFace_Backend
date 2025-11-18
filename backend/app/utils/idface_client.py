@@ -244,6 +244,60 @@ class IDFaceClient:
             }
         )
     
+    async def update_time_zone(self, tz_id: int, tz_data: Dict) -> Dict:
+        """Atualizar fuso horário"""
+        return await self.request(
+            "POST",
+            "modify_objects.fcgi",
+            json={
+                "object": "time_zones",
+                "values": tz_data,
+                "where": {
+                    "time_zones": {"id": tz_id}
+                }
+            }
+        )
+    
+    async def update_time_span(self, span_id: int, span_data: Dict) -> Dict:
+        """Atualizar intervalo de tempo"""
+        return await self.request(
+            "POST",
+            "modify_objects.fcgi",
+            json={
+                "object": "time_spans",
+                "values": span_data,
+                "where": {
+                    "time_spans": {"id": span_id}
+                }
+            }
+        )
+    
+    async def delete_time_zone(self, tz_id: int) -> Dict:
+        """Deletar fuso horário"""
+        return await self.request(
+            "POST",
+            "destroy_objects.fcgi",
+            json={
+                "object": "time_zones",
+                "where": {
+                    "time_zones": {"id": tz_id}
+                }
+            }
+        )
+    
+    async def delete_time_span(self, span_id: int) -> Dict:
+        """Deletar intervalo de tempo"""
+        return await self.request(
+            "POST",
+            "destroy_objects.fcgi",
+            json={
+                "object": "time_spans",
+                "where": {
+                    "time_spans": {"id": span_id}
+                }
+            }
+        )
+    
     # ==================== Access Logs ====================
     
     async def load_access_logs(self) -> Dict:

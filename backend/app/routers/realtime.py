@@ -69,7 +69,10 @@ async def get_recent_activity(
 
 
 @router.get("/monitor")
-async def monitor_full_status(db = Depends(get_db)):
+async def monitor_full_status(
+    since_id: Optional[int] = Query(None, description="ID do último log processado"),
+    db = Depends(get_db)
+):
     """
     Retorna status completo do sistema em tempo real
     
@@ -85,4 +88,4 @@ async def monitor_full_status(db = Depends(get_db)):
     - Usar este endpoint único em vez de múltiplos
     """
     service = RealtimeMonitorService(db)
-    return await service.monitor_full_status()
+    return await service.monitor_full_status(since_id)

@@ -249,18 +249,19 @@ model PortalAccessRule {
 
 // Logs de acesso (Auditoria)
 model AccessLog {
-  id        Int      @id @default(autoincrement())
-  userId    Int?
-  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  id          Int      @id @default(autoincrement())
+  idFaceLogId Int      @unique // ID original do log no dispositivo iDFace
+  userId      Int?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
   
-  portalId  Int?
-  portal    Portal?  @relation(fields: [portalId], references: [id], onDelete: SetNull)
+  portalId    Int?
+  portal      Portal?  @relation(fields: [portalId], references: [id], onDelete: SetNull)
   
-  event     String
-  reason    String?
-  cardValue String?
+  event       String
+  reason      String?
+  cardValue   String?
   
-  timestamp DateTime @default(now())
+  timestamp   DateTime @default(now())
   
   @@map("access_logs")
 }

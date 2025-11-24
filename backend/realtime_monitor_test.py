@@ -142,14 +142,19 @@ class RealtimeMonitorTest:
                 "error": str(e)
             }
     
-    async def test_monitor_full(self) -> Dict[str, Any]:
+    async def test_monitor_full(self, since_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Testa: GET /api/v1/realtime/monitor
         Retorna status completo do sistema (endpoint otimizado)
         """
         try:
+            params = {}
+            if since_id is not None:
+                params["since_id"] = since_id
+
             response = await self.client.get(
-                f"{self.base_url}/api/v1/realtime/monitor"
+                f"{self.base_url}/api/v1/realtime/monitor",
+                params=params
             )
             response.raise_for_status()
             
@@ -225,7 +230,7 @@ class RealtimeMonitorTest:
                 print(f"\n🔄 Iteração #{self.iteration} - {timestamp}")
                 
                 # Chamar endpoint de monitoramento completo
-                result = await self.test_monitor_full()
+                result = await self.test_monitor_full(self.last_log_id)
                 
                 if result["success"]:
                     data = result["data"]
@@ -237,9 +242,13 @@ class RealtimeMonitorTest:
                         if new_count > 0:
                             print(f"\n🔔 {new_count} nova(s) passagem(ns) detectada(s)!")
                             
-                            # Exibir logs recentes
-                            recent_logs = data["logs"].get("recent", [])
-                            for log in recent_logs:
+                            # Atualizar o last_log_id com o mais recente
+                            if data["logs"].get("lastId"):
+                                self.last_log_id = data["logs"]["lastId"]
+                            
+                            # Exibir logs recém encontrados
+                            newly_found_logs = data["logs"].get("newlyFound", [])
+                            for log in newly_found_logs:
                                 self.process_log(log)
                         else:
                             print("   ⏳ Sem novas passagens")

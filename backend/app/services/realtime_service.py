@@ -54,66 +54,68 @@ class RealtimeMonitorService:
     
     async def get_new_access_logs(self, since_id: Optional[int] = None) -> Dict[str, Any]:
         """
-        Busca novos logs de acesso desde o último ID conhecido
-        Equivalente a: POST load_objects.fcgi com access_logs
+        Busca novos logs de acesso desde o último ID conhecido.
+        Segue o padrão EXATO da API iDFace conforme documentação oficial.
         
         Args:
-            since_id: ID do último log processado
+            since_id: ID do último log processado no nosso banco
         
         Returns:
-            Dict com novos logs e contagem
+            Dict com novos logs, contagem e último ID processado
         """
         try:
             async with idface_client:
-                # Construir query similar ao frontend do iDFace
-                payload = {
-                    "join": "LEFT",
-                    "object": "access_logs",
-                    "fields": [
-                        "access_logs.*",
-                        "users.name as user_name",
-                        "users.registration"
-                    ],
-                    "where": [],
-                    "order": ["id"],
-                    "offset": 0
-                }
+                # Carregar todos os logs do dispositivo
+                result = await idface_client.load_access_logs()
+                all_logs = result.get("access_logs", [])
                 
-                # Se temos um ID de referência, buscar apenas logs mais novos
-                if since_id:
-                    payload["where"] = {
-                        "access_logs": {"id": {">": since_id}}
-                    }
+                # Filtrar logs novos baseado no since_id
+                new_logs = []
+                if since_id is None:
+                    # Primeira chamada: retornar vazio
+                    new_logs = []
+                else:
+                    # Filtrar logs que foram salvos após o since_id
+                    last_log_in_db = await self.db.accesslog.find_unique(where={"id": since_id})
+                    if last_log_in_db:
+                        # Retornar apenas logs posteriores ao timestamp do último processado
+                        for log in all_logs:
+                            try:
+                                log_timestamp = log.get("time", 0)
+                                if log_timestamp > last_log_in_db.timestamp.timestamp():
+                                    new_logs.append(log)
+                            except Exception as e:
+                                logger.warning(f"Erro ao processar timestamp do log: {e}")
+                                continue
                 
-                result = await idface_client.request(
-                    "POST",
-                    "load_objects.fcgi",
-                    json=payload
-                )
-                
-                logs = result.get("access_logs", [])
-                
-                # Processar e salvar no banco local
+                # Processar e salvar logs novos
                 saved_logs = []
-                for log in logs:
-                    saved_log = await self._process_and_save_log(log)
+                for log_data in new_logs:
+                    saved_log = await self._process_and_save_log(log_data)
                     if saved_log:
                         saved_logs.append(saved_log)
                 
-                # Atualizar último ID processado
-                if logs and len(logs) > 0:
-                    self.last_log_id = max(log.get("id", 0) for log in logs)
+                # Atualizar o último ID processado
+                if saved_logs:
+                    last_saved = await self.db.accesslog.find_first(
+                        order={"id": "desc"}
+                    )
+                    if last_saved:
+                        self.last_log_id = last_saved.id
                 
                 return {
                     "success": True,
                     "newLogs": saved_logs,
                     "count": len(saved_logs),
+                    "totalCount": len(all_logs),
                     "lastId": self.last_log_id,
                     "timestamp": datetime.now().isoformat()
                 }
                 
         except Exception as e:
             logger.error(f"Erro ao buscar novos logs: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 "success": False,
                 "error": str(e),
@@ -124,16 +126,16 @@ class RealtimeMonitorService:
     async def _process_and_save_log(self, log_data: Dict) -> Optional[Dict]:
         """
         Processa e salva log no banco local
-        Evita duplicatas
+        Evita duplicatas usando o ID do log do dispositivo
         """
         try:
-            # Verificar se já existe
-            existing = await self.db.accesslog.find_first(
-                where={
-                    "timestamp": log_data.get("time"),
-                    "userId": log_data.get("user_id"),
-                    "event": log_data.get("event")
-                }
+            log_id_from_device = log_data.get("id")
+            if not log_id_from_device:
+                return None # Ignorar se não houver ID
+
+            # Verificar se o log do dispositivo já existe
+            existing = await self.db.accesslog.find_unique(
+                where={"idFaceLogId": log_id_from_device}
             )
             
             if existing:
@@ -145,6 +147,7 @@ class RealtimeMonitorService:
             # Criar log
             new_log = await self.db.accesslog.create(
                 data={
+                    "idFaceLogId": log_id_from_device,
                     "userId": log_data.get("user_id"),
                     "portalId": log_data.get("portal_id"),
                     "event": event,
@@ -246,7 +249,7 @@ class RealtimeMonitorService:
                     "user": True,
                     "portal": True
                 },
-                order_by={"timestamp": "desc"}
+                order={"timestamp": "desc"}
             )
             
             formatted_logs = [
@@ -277,18 +280,15 @@ class RealtimeMonitorService:
                 "count": 0
             }
     
-    async def monitor_full_status(self) -> Dict[str, Any]:
+    async def monitor_full_status(self, since_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Retorna status completo do sistema em tempo real
         Combina alarme + logs recentes + estatísticas
         """
         # Buscar dados em paralelo
         alarm_status = await self.check_alarm_status()
-        new_logs = await self.get_new_access_logs(self.last_log_id)
+        new_logs = await self.get_new_access_logs(since_id)
         log_count = await self.get_access_log_count()
-        
-        # Estatísticas rápidas
-        recent_activity = await self.get_recent_activity(minutes=5)
         
         return {
             "success": True,
@@ -301,7 +301,7 @@ class RealtimeMonitorService:
                 "newCount": new_logs.get("count", 0),
                 "totalCount": log_count.get("count", 0),
                 "lastId": new_logs.get("lastId"),
-                "recent": recent_activity.get("logs", [])[:5]  # Últimos 5
+                "newlyFound": new_logs.get("newLogs", [])
             },
             "deviceStatus": "online" if alarm_status.get("success") else "offline"
         }

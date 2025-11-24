@@ -72,6 +72,8 @@ class IDFaceClient:
         await self.ensure_session()
         
         url = f"{self.base_url}/{endpoint}"
+        
+        # Garante que a sessão seja sempre enviada como um parâmetro de URL
         params = kwargs.get("params", {})
         params["session"] = self.session
         kwargs["params"] = params
@@ -301,12 +303,26 @@ class IDFaceClient:
     # ==================== Access Logs ====================
     
     async def load_access_logs(self) -> Dict:
-        """Carregar logs de acesso do dispositivo"""
-        return await self.request(
-            "POST",
-            "load_objects.fcgi",
-            json={"object": "access_logs"}
+        """Carregar logs de acesso do dispositivo - Usa método direto para evitar erro 400"""
+        await self.ensure_session()
+        
+        url = f"{self.base_url}/load_objects.fcgi"
+        params = {"session": self.session}
+        payload = {"object": "access_logs"}
+        
+        # Enviar JSON no corpo da requisição, não nos params
+        response = await self.client.post(
+            url,
+            params=params,
+            json=payload,
+            headers={"Content-Type": "application/json"}
         )
+        response.raise_for_status()
+        
+        try:
+            return response.json()
+        except:
+            return {"access_logs": []}
     
     # ==================== User Access Rules ====================
     

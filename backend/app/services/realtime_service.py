@@ -196,10 +196,6 @@ class RealtimeMonitorService:
                 logger.debug(f"   ⏭️  Log #{log_id_device} já existe no banco")
                 return None
             
-            # Mapear evento
-            event = self._map_event_type(log_data)
-            logger.info(f"   📊 Evento: {event}")
-            
             # ✅ Converter timestamp Unix para datetime
             unix_timestamp = log_data.get("time", 0)
             if unix_timestamp:
@@ -223,7 +219,7 @@ class RealtimeMonitorService:
                     logger.info(f"   👤 Usuário encontrado: {user.name} (iDFace #{user_id_device} → DB #{user_id_db})")
                 else:
                     # Usuário não existe no banco - deixar como null
-                    logger.warning(f"   ⚠️  Usuário iDFace #{user_id_device} não cadastrado no banco")
+                    logger.warning(f"   ⚠️  Usuário iDFace #{user_id_device} não cadastrado no banco (face desconhecida)")
                     user_id_db = None
             
             # ✅ VALIDAR FOREIGN KEYS: Verificar se portal existe
@@ -244,14 +240,18 @@ class RealtimeMonitorService:
                     logger.warning(f"   ⚠️  Portal iDFace #{portal_id_device} não cadastrado no banco")
                     portal_id_db = None
             
+            # Determinar o status do acesso e razão
+            event_display, reason = self._determine_access_status(log_data, user, portal)
+            logger.info(f"   📊 Status: {event_display} | Razão: {reason}")
+            
             # Criar log no banco (userId e portalId podem ser null)
             new_log = await self.db.accesslog.create(
                 data={
                     "idFaceLogId": log_id_device,
                     "userId": user_id_db,  # ✅ Pode ser null
                     "portalId": portal_id_db,  # ✅ Pode ser null
-                    "event": event,
-                    "reason": None,
+                    "event": event_display,  # ✅ Usar mensagem traduzida
+                    "reason": reason,  # ✅ Adicionar motivo se houver
                     "cardValue": None,
                     "timestamp": timestamp
                 }
@@ -289,13 +289,56 @@ class RealtimeMonitorService:
         
         # ✅ Mapear baseado em dados reais
         if event_code == 7:
-            return "access_granted"
+            return "Acesso Concedido"
         elif event_code == 0:
-            return "access_denied"
+            return "Acesso Negado"
         elif event_code == 1:
-            return "access_denied"
+            return "Acesso Negado"
         else:
-            return "unknown"
+            return "Desconhecido"
+    
+    def _determine_access_status(self, log_data: Dict, user: Optional[Any], portal: Optional[Any]) -> tuple:
+        """
+        Determina o status de acesso e a razão baseado nos dados disponíveis
+        
+        Returns:
+            (event_display, reason) - Mensagem do evento e razão (se houver)
+        """
+        event_code = log_data.get("event", 0)
+        user_id_device = log_data.get("user_id")
+        portal_id_device = log_data.get("portal_id")
+        
+        # ✅ Caso 1: Acesso Concedido - usuário existe e tem portal
+        if event_code == 7:
+            if user and portal:
+                return ("Acesso Concedido", None)
+            elif user and not portal:
+                # Usuário existe mas portal não está cadastrado
+                return ("Acesso Negado", "Portal não cadastrado")
+            elif not user and portal:
+                # Face desconhecida mas o sistema retornou event=7 (raro)
+                return ("Acesso Negado", "Face desconhecida")
+            else:
+                # Nenhum dado disponível
+                return ("Acesso Negado", "Usuário/Portal não encontrados")
+        
+        # ✅ Caso 2: Acesso Negado - verificar razão
+        elif event_code == 0 or event_code == 1:
+            if user_id_device and not user:
+                # Face desconhecida
+                return ("Acesso Negado", "Face desconhecida")
+            elif user and not portal:
+                # Usuário existe mas sem acesso ao portal
+                return ("Acesso Negado", "Sem acesso ao portal")
+            elif user and portal:
+                # Ambos existem mas evento é negado (acesso expirado, horário, etc)
+                return ("Acesso Negado", "Acesso não autorizado")
+            else:
+                return ("Acesso Negado", "Motivo desconhecido")
+        
+        # ✅ Caso 3: Evento desconhecido
+        else:
+            return ("Desconhecido", "Tipo de evento não mapeado")
     
     async def get_access_log_count(self) -> Dict[str, Any]:
         """

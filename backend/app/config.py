@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     IDFACE_IP: str
     IDFACE_LOGIN: str
     IDFACE_PASSWORD: str
+    IDFACE_GATEWAY: str
+    IDFACE_NETMASK: str
     
     # API Configuration
     API_TITLE: str = "iDFace Control System"

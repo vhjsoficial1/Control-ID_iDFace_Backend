@@ -55,7 +55,7 @@ class RealtimeMonitorService:
     async def get_new_access_logs(self, since_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Busca novos logs de acesso desde o último ID conhecido.
-        Segue o padrão EXATO da API iDFace conforme documentação oficial.
+        Segue o padrão EXATO da API iDFace conforme capturas de rede real.
         
         Args:
             since_id: ID do último log processado no nosso banco
@@ -64,53 +64,103 @@ class RealtimeMonitorService:
             Dict com novos logs, contagem e último ID processado
         """
         try:
+            # 1. Determinar timestamp de corte
+            since_timestamp = 0
+            if since_id:
+                last_log = await self.db.accesslog.find_unique(
+                    where={"id": since_id}
+                )
+                if last_log:
+                    # ⚠️ IMPORTANTE: Subtrair 1 segundo porque a API iDFace retorna
+                    # logs com timestamp > since_timestamp (não >=)
+                    # Se não subtrairmos, não retorna novos logs com timestamp igual
+                    since_timestamp = int(last_log.timestamp.timestamp()) - 1
+                    logger.info(f"🔍 Buscando logs desde ID {since_id} (timestamp: {since_timestamp})")
+            else:
+                logger.info(f"🔍 Primeira busca: buscando TODOS os logs (since_timestamp=0)")
+            
+            # 2. Buscar logs filtrados do dispositivo
+            logger.info(f"📡 Chamando load_access_logs_filtered(since_timestamp={since_timestamp})")
             async with idface_client:
-                # Carregar todos os logs do dispositivo
-                result = await idface_client.load_access_logs()
-                all_logs = result.get("access_logs", [])
+                result = await idface_client.load_access_logs_filtered(
+                    since_timestamp=since_timestamp,
+                    limit=7  # ✅ Conforme frontend real
+                )
                 
-                # Filtrar logs novos baseado no since_id
-                new_logs = []
-                if since_id is None:
-                    # Primeira chamada: retornar vazio
-                    new_logs = []
-                else:
-                    # Filtrar logs que foram salvos após o since_id
-                    last_log_in_db = await self.db.accesslog.find_unique(where={"id": since_id})
-                    if last_log_in_db:
-                        # Retornar apenas logs posteriores ao timestamp do último processado
-                        for log in all_logs:
-                            try:
-                                log_timestamp = log.get("time", 0)
-                                if log_timestamp > last_log_in_db.timestamp.timestamp():
-                                    new_logs.append(log)
-                            except Exception as e:
-                                logger.warning(f"Erro ao processar timestamp do log: {e}")
-                                continue
+                device_logs = result.get("access_logs", [])
+            
+            logger.info(f"📊 Device retornou {len(device_logs)} logs")
+            if device_logs:
+                logger.info(f"   Primeiros logs: {[l.get('id') for l in device_logs[:3]]}")
+            
+            # 3. Enriquecer cada log com dados do usuário e área
+            enriched_logs = []
+            for log_data in device_logs:
+                log_id_device = log_data.get("id")
+                if not log_id_device:
+                    continue
                 
-                # Processar e salvar logs novos
-                saved_logs = []
-                for log_data in new_logs:
-                    saved_log = await self._process_and_save_log(log_data)
-                    if saved_log:
-                        saved_logs.append(saved_log)
+                # Verificar duplicata
+                existing = await self.db.accesslog.find_unique(
+                    where={"idFaceLogId": log_id_device}
+                )
+                if existing:
+                    continue
                 
-                # Atualizar o último ID processado
-                if saved_logs:
-                    last_saved = await self.db.accesslog.find_first(
-                        order={"id": "desc"}
-                    )
-                    if last_saved:
-                        self.last_log_id = last_saved.id
+                # ✅ Buscar dados do usuário
+                if log_data.get("user_id"):
+                    try:
+                        async with idface_client:
+                            user_result = await idface_client.load_users_by_id(log_data["user_id"])
+                            user_data = user_result.get("users", [{}])[0]
+                            log_data["user_name"] = user_data.get("name", "Desconhecido")
+                            log_data["registration"] = user_data.get("registration", "")
+                    except Exception as e:
+                        logger.warning(f"Erro ao buscar usuário {log_data.get('user_id')}: {e}")
+                        log_data["user_name"] = "Desconhecido"
+                        log_data["registration"] = ""
                 
-                return {
-                    "success": True,
-                    "newLogs": saved_logs,
-                    "count": len(saved_logs),
-                    "totalCount": len(all_logs),
-                    "lastId": self.last_log_id,
-                    "timestamp": datetime.now().isoformat()
-                }
+                # ✅ Buscar dados da área/portal
+                if log_data.get("portal_id"):
+                    try:
+                        async with idface_client:
+                            area_result = await idface_client.load_areas(
+                                where_field="id",
+                                where_value=log_data["portal_id"]  # ID do portal/área
+                            )
+                            area_data = area_result.get("areas", [{}])[0]
+                            log_data["area_name"] = area_data.get("name", "Entrada")
+                    except Exception as e:
+                        logger.warning(f"Erro ao buscar área: {e}")
+                        log_data["area_name"] = "Entrada"
+                
+                enriched_logs.append(log_data)
+            
+            # 4. Processar e salvar logs novos
+            saved_logs = []
+            for log_data in enriched_logs:
+                saved_log = await self._process_and_save_log(log_data)
+                if saved_log:
+                    saved_logs.append(saved_log)
+            
+            # 5. Retornar último ID
+            last_id = None
+            if saved_logs:
+                latest = await self.db.accesslog.find_first(
+                    order={"id": "desc"}
+                )
+                if latest:
+                    last_id = latest.id
+            elif since_id:
+                last_id = since_id
+            
+            return {
+                "success": True,
+                "newLogs": saved_logs,
+                "count": len(saved_logs),
+                "lastId": last_id,
+                "timestamp": datetime.now().isoformat()
+            }
                 
         except Exception as e:
             logger.error(f"Erro ao buscar novos logs: {e}")
@@ -120,82 +170,132 @@ class RealtimeMonitorService:
                 "success": False,
                 "error": str(e),
                 "newLogs": [],
-                "count": 0
+                "count": 0,
+                "lastId": since_id
             }
     
     async def _process_and_save_log(self, log_data: Dict) -> Optional[Dict]:
         """
         Processa e salva log no banco local
-        Evita duplicatas usando o ID do log do dispositivo
+        Evita duplicatas usando idFaceLogId
+        ✅ Corrigido para validar foreign keys antes de criar
         """
         try:
-            log_id_from_device = log_data.get("id")
-            if not log_id_from_device:
-                return None # Ignorar se não houver ID
-
-            # Verificar se o log do dispositivo já existe
+            log_id_device = log_data.get("id")
+            if not log_id_device:
+                logger.warning("Log sem ID recebido")
+                return None
+            
+            logger.info(f"📝 Processando log #{log_id_device} do device")
+            
+            # Verificar se já existe
             existing = await self.db.accesslog.find_unique(
-                where={"idFaceLogId": log_id_from_device}
+                where={"idFaceLogId": log_id_device}
             )
-            
             if existing:
-                return None  # Já existe
+                logger.debug(f"   ⏭️  Log #{log_id_device} já existe no banco")
+                return None
             
-            # Determinar evento baseado nos dados do iDFace
+            # Mapear evento
             event = self._map_event_type(log_data)
+            logger.info(f"   📊 Evento: {event}")
             
-            # Criar log
+            # ✅ Converter timestamp Unix para datetime
+            unix_timestamp = log_data.get("time", 0)
+            if unix_timestamp:
+                timestamp = datetime.fromtimestamp(unix_timestamp)
+            else:
+                timestamp = datetime.now()
+            logger.info(f"   🕐 Timestamp: {timestamp.isoformat()}")
+            
+            # ✅ VALIDAR FOREIGN KEYS: Verificar se usuário existe
+            user_id_device = log_data.get("user_id")
+            user_id_db = None
+            user = None
+            
+            if user_id_device:
+                # Procurar usuário pelo idFaceId
+                user = await self.db.user.find_unique(
+                    where={"idFaceId": user_id_device}
+                )
+                if user:
+                    user_id_db = user.id
+                    logger.info(f"   👤 Usuário encontrado: {user.name} (iDFace #{user_id_device} → DB #{user_id_db})")
+                else:
+                    # Usuário não existe no banco - deixar como null
+                    logger.warning(f"   ⚠️  Usuário iDFace #{user_id_device} não cadastrado no banco")
+                    user_id_db = None
+            
+            # ✅ VALIDAR FOREIGN KEYS: Verificar se portal existe
+            portal_id_device = log_data.get("portal_id")
+            portal_id_db = None
+            portal = None
+            
+            if portal_id_device:
+                # Procurar portal pelo idFaceId
+                portal = await self.db.portal.find_unique(
+                    where={"idFaceId": portal_id_device}
+                )
+                if portal:
+                    portal_id_db = portal.id
+                    logger.info(f"   🚪 Portal encontrado: {portal.name} (iDFace #{portal_id_device} → DB #{portal_id_db})")
+                else:
+                    # Portal não existe no banco - deixar como null
+                    logger.warning(f"   ⚠️  Portal iDFace #{portal_id_device} não cadastrado no banco")
+                    portal_id_db = None
+            
+            # Criar log no banco (userId e portalId podem ser null)
             new_log = await self.db.accesslog.create(
                 data={
-                    "idFaceLogId": log_id_from_device,
-                    "userId": log_data.get("user_id"),
-                    "portalId": log_data.get("portal_id"),
+                    "idFaceLogId": log_id_device,
+                    "userId": user_id_db,  # ✅ Pode ser null
+                    "portalId": portal_id_db,  # ✅ Pode ser null
                     "event": event,
-                    "reason": log_data.get("reason"),
-                    "cardValue": str(log_data.get("card_value")) if log_data.get("card_value") else None,
-                    "timestamp": log_data.get("time", datetime.now())
+                    "reason": None,
+                    "cardValue": None,
+                    "timestamp": timestamp
                 }
             )
             
-            # Retornar log formatado para o frontend
-            user = await self.db.user.find_unique(where={"id": new_log.userId}) if new_log.userId else None
-            portal = await self.db.portal.find_unique(where={"id": new_log.portalId}) if new_log.portalId else None
+            logger.info(f"   ✅ Log salvo com sucesso! ID no banco: {new_log.id}")
             
+            # Retornar formatado
             return {
                 "id": new_log.id,
+                "idFaceLogId": new_log.idFaceLogId,
                 "userId": new_log.userId,
-                "userName": user.name if user else "Desconhecido",
+                "userName": user.name if user else log_data.get("user_name", "Desconhecido"),
                 "portalId": new_log.portalId,
-                "portalName": portal.name if portal else "N/A",
+                "portalName": portal.name if portal else log_data.get("area_name", "Entrada"),
                 "event": new_log.event,
-                "reason": new_log.reason,
-                "cardValue": new_log.cardValue,
                 "timestamp": new_log.timestamp.isoformat()
             }
             
         except Exception as e:
             logger.error(f"Erro ao processar log: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def _map_event_type(self, log_data: Dict) -> str:
         """
         Mapeia tipo de evento do iDFace para nosso sistema
+        ✅ Baseado em dados REAIS do frontend:
+        - event = 7: Acesso normal/autorizado
+        - event = 0: Acesso negado
+        - log_type_id = -1: Tipo genérico
         """
-        # Mapear códigos do iDFace para eventos legíveis
         event_code = log_data.get("event", 0)
         
-        event_map = {
-            0: "access_granted",
-            1: "access_denied",
-            2: "unknown_user",
-            3: "invalid_credential",
-            4: "expired_access",
-            5: "time_restriction",
-            6: "door_forced",
-            7: "door_left_open"
-        }
-        
-        return event_map.get(event_code, "unknown")
+        # ✅ Mapear baseado em dados reais
+        if event_code == 7:
+            return "access_granted"
+        elif event_code == 0:
+            return "access_denied"
+        elif event_code == 1:
+            return "access_denied"
+        else:
+            return "unknown"
     
     async def get_access_log_count(self) -> Dict[str, Any]:
         """

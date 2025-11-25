@@ -324,6 +324,150 @@ class IDFaceClient:
         except:
             return {"access_logs": []}
     
+    async def load_access_logs_filtered(self, since_timestamp: int = 0, limit: int = 7) -> Dict:
+        """Carregar logs de acesso filtrados por timestamp - CORRIGIDO conforme frontend real"""
+        await self.ensure_session()
+        
+        url = f"{self.base_url}/load_objects.fcgi"
+        params = {"session": self.session}
+        
+        # ✅ Payload EXATO do frontend real
+        payload = {
+            "join": "LEFT",
+            "object": "access_logs",
+            "fields": ["id", "time", "user_id", "portal_id", "log_type_id", "event"],
+            "offset": 0,
+            "order": ["time", "descending"],
+            "limit": limit,
+            "finish": True  # ✅ Campo importante!
+        }
+        
+        # Adicionar filtro WHERE se timestamp > 0
+        if since_timestamp > 0:
+            payload["where"] = [{
+                "field": "time",
+                "value": since_timestamp,
+                "operator": ">",
+                "connector": ") AND ("
+            }]
+        else:
+            payload["where"] = []
+        
+        response = await self.client.post(
+            url,
+            params=params,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        response.raise_for_status()
+        
+        try:
+            return response.json()
+        except:
+            return {"access_logs": []}
+    
+    async def count_access_logs(self) -> Dict:
+        """Contar total de logs de acesso no dispositivo - CORRIGIDO"""
+        await self.ensure_session()
+        
+        url = f"{self.base_url}/load_objects.fcgi"
+        params = {"session": self.session}
+        
+        # ✅ Payload EXATO do frontend
+        payload = {
+            "join": "LEFT",
+            "object": "access_logs",
+            "fields": ["COUNT(*)"],
+            "where": [],
+            "order": ["id"],
+            "offset": 0
+        }
+        
+        response = await self.client.post(
+            url,
+            params=params,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        response.raise_for_status()
+        
+        try:
+            return response.json()
+        except:
+            return {"access_logs": []}
+    
+    async def load_areas(self, where_field: str = "id", where_value: int = None) -> Dict:
+        """Carregar informações de áreas (portais) - NOVO"""
+        await self.ensure_session()
+        
+        url = f"{self.base_url}/load_objects.fcgi"
+        params = {"session": self.session}
+        
+        # ✅ Conforme frontend real
+        payload = {
+            "join": "LEFT",
+            "object": "areas",
+            "fields": ["id", "name"],
+            "order": ["name"]
+        }
+        
+        if where_value is not None:
+            payload["where"] = [{
+                "object": "access_logs",
+                "field": where_field,
+                "value": where_value,
+                "connector": ") AND ("
+            }]
+        else:
+            payload["where"] = []
+        
+        response = await self.client.post(
+            url,
+            params=params,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        response.raise_for_status()
+        
+        try:
+            return response.json()
+        except:
+            return {"areas": []}
+    
+    async def load_users_by_id(self, user_id: int) -> Dict:
+        """Carregar dados do usuário - NOVO"""
+        await self.ensure_session()
+        
+        url = f"{self.base_url}/load_objects.fcgi"
+        params = {"session": self.session}
+        
+        # ✅ Payload EXATO do frontend
+        payload = {
+            "join": "LEFT",
+            "object": "users",
+            "fields": ["id", "name", "registration", "password", "panic_password", "salt", "panic_salt", "begin_time", "end_time", "user_type_id", "last_access"],
+            "where": [{
+                "object": "users",
+                "field": "id",
+                "value": user_id,
+                "connector": ") AND ("
+            }],
+            "order": ["name"]
+        }
+        
+        response = await self.client.post(
+            url,
+            params=params,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        response.raise_for_status()
+        
+        try:
+            return response.json()
+        except:
+            return {"users": []}
+    
     # ==================== User Access Rules ====================
     
     async def create_user_access_rule(self, user_id: int, access_rule_id: int) -> Dict:

@@ -1064,3 +1064,29 @@ async def get_sync_summary(db = Depends(get_db)):
         failedRecords=0,
         skippedRecords=total_records - synced_records
     )
+
+
+# ==================== Portal Sync ====================
+
+@router.post("/portals")
+async def sync_portals_endpoint(db = Depends(get_db)):
+    """
+    Sincroniza portais (áreas) do dispositivo iDFace com o banco de dados PostgreSQL
+    
+    Retorna a lista de portais sincronizados do leitor
+    """
+    from app.services.portal_sync_service import portal_sync_service
+    
+    result = await portal_sync_service.sync_portals_from_device()
+    return result
+
+
+@router.get("/portals")
+async def get_synced_portals_endpoint(db = Depends(get_db)):
+    """
+    Retorna lista de portais sincronizados no banco de dados
+    """
+    from app.services.portal_sync_service import portal_sync_service
+    
+    result = await portal_sync_service.get_synced_portals()
+    return result

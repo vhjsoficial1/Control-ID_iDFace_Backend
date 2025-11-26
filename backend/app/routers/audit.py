@@ -23,17 +23,42 @@ async def create_access_log(log: AccessLogCreate, db = Depends(get_db)):
     (Normalmente criado automaticamente pelo sistema)
     """
     try:
+        # Gerar um idFaceLogId único (timestamp em ms)
+        import time
+        idFaceLogId = int(time.time() * 1000)
+        
         new_log = await db.accesslog.create(
             data={
+                "idFaceLogId": idFaceLogId,
                 "userId": log.userId,
                 "portalId": log.portalId,
                 "event": log.event,
                 "reason": log.reason,
                 "cardValue": log.cardValue,
-                "timestamp": log.timestamp
+                "timestamp": log.timestamp if log.timestamp else datetime.now()
             }
         )
-        return new_log
+        
+        # Buscar dados relacionados
+        log_with_relations = await db.accesslog.find_unique(
+            where={"id": new_log.id},
+            include={
+                "user": True,
+                "portal": True
+            }
+        )
+        
+        return AccessLogResponse(
+            id=log_with_relations.id,
+            userId=log_with_relations.userId,
+            portalId=log_with_relations.portalId,
+            event=log_with_relations.event,
+            reason=log_with_relations.reason,
+            cardValue=log_with_relations.cardValue,
+            timestamp=log_with_relations.timestamp,
+            userName=log_with_relations.user.name if log_with_relations.user else None,
+            portalName=log_with_relations.portal.name if log_with_relations.portal else None
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -59,10 +84,10 @@ async def list_access_logs(
     # Construir filtros
     where = {}
     
-    if userId:
+    if userId is not None:
         where["userId"] = userId
     
-    if portalId:
+    if portalId is not None:
         where["portalId"] = portalId
     
     if event:
@@ -79,38 +104,43 @@ async def list_access_logs(
         if endDate:
             where["timestamp"]["lte"] = endDate
     
-    # Buscar logs
-    logs = await db.accesslog.find_many(
-        where=where,
-        skip=skip,
-        take=limit,
-        order_by={"timestamp": "desc"},
-        include={
-            "user": True,
-            "portal": True
-        }
-    )
-    
-    # Contar total
-    total = await db.accesslog.count(where=where)
-    
-    # Formatar resposta com nomes
-    formatted_logs = []
-    for log in logs:
-        log_dict = {
-            "id": log.id,
-            "userId": log.userId,
-            "portalId": log.portalId,
-            "event": log.event,
-            "reason": log.reason,
-            "cardValue": log.cardValue,
-            "timestamp": log.timestamp,
-            "userName": log.user.name if log.user else None,
-            "portalName": log.portal.name if log.portal else None
-        }
-        formatted_logs.append(AccessLogResponse(**log_dict))
-    
-    return AccessLogListResponse(total=total, logs=formatted_logs)
+    try:
+        # Buscar logs
+        logs = await db.accesslog.find_many(
+            where=where,
+            skip=skip,
+            take=limit,
+            order={"timestamp": "desc"},
+            include={
+                "user": True,
+                "portal": True
+            }
+        )
+        
+        # Contar total
+        total = await db.accesslog.count(where=where)
+        
+        # Formatar resposta com nomes
+        formatted_logs = []
+        for log in logs:
+            formatted_logs.append(AccessLogResponse(
+                id=log.id,
+                userId=log.userId,
+                portalId=log.portalId,
+                event=log.event,
+                reason=log.reason,
+                cardValue=log.cardValue,
+                timestamp=log.timestamp,
+                userName=log.user.name if log.user else None,
+                portalName=log.portal.name if log.portal else None
+            ))
+        
+        return AccessLogListResponse(total=total, logs=formatted_logs)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao buscar logs: {str(e)}"
+        )
 
 
 @router.get("/{log_id}", response_model=AccessLogWithDetails)
@@ -118,49 +148,63 @@ async def get_access_log(log_id: int, db = Depends(get_db)):
     """
     Busca um log específico com todos os detalhes
     """
-    log = await db.accesslog.find_unique(
-        where={"id": log_id},
-        include={
-            "user": {
-                "include": {
-                    "cards": True,
-                    "qrcodes": True
-                }
-            },
-            "portal": True
-        }
-    )
-    
-    if not log:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Log {log_id} não encontrado"
+    try:
+        log = await db.accesslog.find_unique(
+            where={"id": log_id},
+            include={
+                "user": {
+                    "include": {
+                        "cards": True,
+                        "qrcodes": True
+                    }
+                },
+                "portal": True
+            }
         )
-    
-    # Formatar resposta
-    response = {
-        "id": log.id,
-        "userId": log.userId,
-        "portalId": log.portalId,
-        "event": log.event,
-        "reason": log.reason,
-        "cardValue": log.cardValue,
-        "timestamp": log.timestamp,
-        "userName": log.user.name if log.user else None,
-        "portalName": log.portal.name if log.portal else None,
-        "user": {
-            "id": log.user.id,
-            "name": log.user.name,
-            "registration": log.user.registration,
-            "cards": [{"id": c.id, "value": str(c.value)} for c in log.user.cards]
-        } if log.user else None,
-        "portal": {
-            "id": log.portal.id,
-            "name": log.portal.name
-        } if log.portal else None
-    }
-    
-    return AccessLogWithDetails(**response)
+        
+        if not log:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Log {log_id} não encontrado"
+            )
+        
+        # Formatar resposta
+        user_data = None
+        if log.user:
+            user_data = {
+                "id": log.user.id,
+                "name": log.user.name,
+                "registration": log.user.registration,
+                "cards": [{"id": c.id, "value": str(c.value)} for c in log.user.cards]
+            }
+        
+        portal_data = None
+        if log.portal:
+            portal_data = {
+                "id": log.portal.id,
+                "name": log.portal.name
+            }
+        
+        return AccessLogWithDetails(
+            id=log.id,
+            userId=log.userId,
+            portalId=log.portalId,
+            event=log.event,
+            reason=log.reason,
+            cardValue=log.cardValue,
+            timestamp=log.timestamp,
+            userName=log.user.name if log.user else None,
+            portalName=log.portal.name if log.portal else None,
+            user=user_data,
+            portal=portal_data
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao buscar log: {str(e)}"
+        )
 
 
 @router.delete("/{log_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -169,14 +213,22 @@ async def delete_access_log(log_id: int, db = Depends(get_db)):
     Remove um log de acesso
     (Usar com cautela - pode afetar auditoria)
     """
-    existing = await db.accesslog.find_unique(where={"id": log_id})
-    if not existing:
+    try:
+        existing = await db.accesslog.find_unique(where={"id": log_id})
+        if not existing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Log {log_id} não encontrado"
+            )
+        
+        await db.accesslog.delete(where={"id": log_id})
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Log {log_id} não encontrado"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao deletar log: {str(e)}"
         )
-    
-    await db.accesslog.delete(where={"id": log_id})
 
 
 # ==================== Bulk Operations ====================
@@ -209,17 +261,23 @@ async def bulk_delete_logs(
             detail="Pelo menos um filtro deve ser fornecido"
         )
     
-    # Contar antes de deletar
-    count = await db.accesslog.count(where=where)
-    
-    # Deletar
-    await db.accesslog.delete_many(where=where)
-    
-    return {
-        "success": True,
-        "message": f"{count} logs removidos com sucesso",
-        "deletedCount": count
-    }
+    try:
+        # Contar antes de deletar
+        count = await db.accesslog.count(where=where)
+        
+        # Deletar
+        await db.accesslog.delete_many(where=where)
+        
+        return {
+            "success": True,
+            "message": f"{count} logs removidos com sucesso",
+            "deletedCount": count
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao deletar logs: {str(e)}"
+        )
 
 
 # ==================== Statistics & Reports ====================
@@ -246,147 +304,153 @@ async def get_access_statistics(
         if endDate:
             where["timestamp"]["lte"] = endDate
     
-    # Buscar todos os logs no período
-    logs = await db.accesslog.find_many(
-        where=where,
-        include={
-            "user": True,
-            "portal": True
-        }
-    )
-    
-    total_logs = len(logs)
-    
-    if total_logs == 0:
-        return AccessStatisticsResponse(
-            totalLogs=0,
-            dateRange={},
-            byEvent=[]
+    try:
+        # Buscar todos os logs no período
+        logs = await db.accesslog.find_many(
+            where=where,
+            include={
+                "user": True,
+                "portal": True
+            }
         )
-    
-    # Estatísticas por evento
-    event_counts = Counter(log.event for log in logs)
-    by_event = [
-        AccessStatsByEvent(
-            event=event,
-            count=count,
-            percentage=round((count / total_logs) * 100, 2)
-        )
-        for event, count in event_counts.most_common()
-    ]
-    
-    # Range de datas
-    timestamps = [log.timestamp for log in logs]
-    date_range = {
-        "start": min(timestamps).isoformat(),
-        "end": max(timestamps).isoformat()
-    }
-    
-    # Estatísticas por hora (opcional)
-    by_hour = None
-    if groupByHour:
-        hour_counts = Counter(log.timestamp.hour for log in logs)
-        by_hour = [
-            AccessStatsByHour(hour=hour, count=count)
-            for hour, count in sorted(hour_counts.items())
+        
+        total_logs = len(logs)
+        
+        if total_logs == 0:
+            return AccessStatisticsResponse(
+                totalLogs=0,
+                dateRange={},
+                byEvent=[]
+            )
+        
+        # Estatísticas por evento
+        event_counts = Counter(log.event for log in logs)
+        by_event = [
+            AccessStatsByEvent(
+                event=event,
+                count=count,
+                percentage=round((count / total_logs) * 100, 2)
+            )
+            for event, count in event_counts.most_common()
         ]
-    
-    # Estatísticas por data (opcional)
-    by_date = None
-    if groupByDate:
-        date_stats = defaultdict(lambda: {"granted": 0, "denied": 0, "unknown": 0, "total": 0})
+        
+        # Range de datas
+        timestamps = [log.timestamp for log in logs]
+        date_range = {
+            "start": min(timestamps).isoformat(),
+            "end": max(timestamps).isoformat()
+        }
+        
+        # Estatísticas por hora (opcional)
+        by_hour = None
+        if groupByHour:
+            hour_counts = Counter(log.timestamp.hour for log in logs)
+            by_hour = [
+                AccessStatsByHour(hour=hour, count=count)
+                for hour, count in sorted(hour_counts.items())
+            ]
+        
+        # Estatísticas por data (opcional)
+        by_date = None
+        if groupByDate:
+            date_stats = defaultdict(lambda: {"granted": 0, "denied": 0, "unknown": 0, "total": 0})
+            
+            for log in logs:
+                date_key = log.timestamp.strftime("%Y-%m-%d")
+                date_stats[date_key]["total"] += 1
+                
+                if log.event == "access_granted":
+                    date_stats[date_key]["granted"] += 1
+                elif log.event == "access_denied":
+                    date_stats[date_key]["denied"] += 1
+                elif log.event == "unknown_user":
+                    date_stats[date_key]["unknown"] += 1
+            
+            by_date = [
+                AccessStatsByDate(
+                    date=date,
+                    granted=stats["granted"],
+                    denied=stats["denied"],
+                    unknown=stats["unknown"],
+                    total=stats["total"]
+                )
+                for date, stats in sorted(date_stats.items())
+            ]
+        
+        # Top usuários
+        user_stats = defaultdict(lambda: {"granted": 0, "denied": 0, "lastAccess": None, "name": ""})
         
         for log in logs:
-            date_key = log.timestamp.strftime("%Y-%m-%d")
-            date_stats[date_key]["total"] += 1
-            
-            if log.event == "access_granted":
-                date_stats[date_key]["granted"] += 1
-            elif log.event == "access_denied":
-                date_stats[date_key]["denied"] += 1
-            elif log.event == "unknown_user":
-                date_stats[date_key]["unknown"] += 1
+            if log.userId:
+                if log.event == "access_granted":
+                    user_stats[log.userId]["granted"] += 1
+                elif log.event == "access_denied":
+                    user_stats[log.userId]["denied"] += 1
+                
+                if not user_stats[log.userId]["lastAccess"] or log.timestamp > user_stats[log.userId]["lastAccess"]:
+                    user_stats[log.userId]["lastAccess"] = log.timestamp
+                user_stats[log.userId]["name"] = log.user.name if log.user else f"User {log.userId}"
         
-        by_date = [
-            AccessStatsByDate(
-                date=date,
-                granted=stats["granted"],
-                denied=stats["denied"],
-                unknown=stats["unknown"],
-                total=stats["total"]
-            )
-            for date, stats in sorted(date_stats.items())
-        ]
-    
-    # Top usuários
-    user_stats = defaultdict(lambda: {"granted": 0, "denied": 0, "lastAccess": None})
-    
-    for log in logs:
-        if log.userId:
-            if log.event == "access_granted":
-                user_stats[log.userId]["granted"] += 1
-            elif log.event == "access_denied":
-                user_stats[log.userId]["denied"] += 1
-            
-            if not user_stats[log.userId]["lastAccess"] or log.timestamp > user_stats[log.userId]["lastAccess"]:
-                user_stats[log.userId]["lastAccess"] = log.timestamp
-            user_stats[log.userId]["name"] = log.user.name if log.user else f"User {log.userId}"
-    
-    top_users = sorted(
-        [
-            AccessStatsByUser(
-                userId=user_id,
-                userName=stats["name"],
-                totalAccess=stats["granted"] + stats["denied"],
-                granted=stats["granted"],
-                denied=stats["denied"],
-                lastAccess=stats["lastAccess"]
-            )
-            for user_id, stats in user_stats.items()
-        ],
-        key=lambda x: x.totalAccess,
-        reverse=True
-    )[:topUsersLimit]
-    
-    # Top portais
-    portal_stats = defaultdict(lambda: {"granted": 0, "denied": 0, "unknown": 0})
-    
-    for log in logs:
-        if log.portalId:
-            if log.event == "access_granted":
-                portal_stats[log.portalId]["granted"] += 1
-            elif log.event == "access_denied":
-                portal_stats[log.portalId]["denied"] += 1
-            elif log.event == "unknown_user":
-                portal_stats[log.portalId]["unknown"] += 1
-            
-            portal_stats[log.portalId]["name"] = log.portal.name if log.portal else f"Portal {log.portalId}"
-    
-    top_portals = sorted(
-        [
-            AccessStatsByPortal(
-                portalId=portal_id,
-                portalName=stats["name"],
-                totalAccess=stats["granted"] + stats["denied"] + stats["unknown"],
-                granted=stats["granted"],
-                denied=stats["denied"],
-                unknownUsers=stats["unknown"]
-            )
-            for portal_id, stats in portal_stats.items()
-        ],
-        key=lambda x: x.totalAccess,
-        reverse=True
-    )[:topPortalsLimit]
-    
-    return AccessStatisticsResponse(
-        totalLogs=total_logs,
-        dateRange=date_range,
-        byEvent=by_event,
-        byHour=by_hour,
-        byDate=by_date,
-        topUsers=top_users,
-        topPortals=top_portals
-    )
+        top_users = sorted(
+            [
+                AccessStatsByUser(
+                    userId=user_id,
+                    userName=stats["name"],
+                    totalAccess=stats["granted"] + stats["denied"],
+                    granted=stats["granted"],
+                    denied=stats["denied"],
+                    lastAccess=stats["lastAccess"]
+                )
+                for user_id, stats in user_stats.items()
+            ],
+            key=lambda x: x.totalAccess,
+            reverse=True
+        )[:topUsersLimit]
+        
+        # Top portais
+        portal_stats = defaultdict(lambda: {"granted": 0, "denied": 0, "unknown": 0, "name": ""})
+        
+        for log in logs:
+            if log.portalId:
+                if log.event == "access_granted":
+                    portal_stats[log.portalId]["granted"] += 1
+                elif log.event == "access_denied":
+                    portal_stats[log.portalId]["denied"] += 1
+                elif log.event == "unknown_user":
+                    portal_stats[log.portalId]["unknown"] += 1
+                
+                portal_stats[log.portalId]["name"] = log.portal.name if log.portal else f"Portal {log.portalId}"
+        
+        top_portals = sorted(
+            [
+                AccessStatsByPortal(
+                    portalId=portal_id,
+                    portalName=stats["name"],
+                    totalAccess=stats["granted"] + stats["denied"] + stats["unknown"],
+                    granted=stats["granted"],
+                    denied=stats["denied"],
+                    unknownUsers=stats["unknown"]
+                )
+                for portal_id, stats in portal_stats.items()
+            ],
+            key=lambda x: x.totalAccess,
+            reverse=True
+        )[:topPortalsLimit]
+        
+        return AccessStatisticsResponse(
+            totalLogs=total_logs,
+            dateRange=date_range,
+            byEvent=by_event,
+            byHour=by_hour,
+            byDate=by_date,
+            topUsers=top_users,
+            topPortals=top_portals
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao gerar estatísticas: {str(e)}"
+        )
 
 
 # ==================== User-specific queries ====================
@@ -403,49 +467,57 @@ async def get_user_access_history(
     """
     Retorna histórico de acessos de um usuário específico
     """
-    # Verificar se usuário existe
-    user = await db.user.find_unique(where={"id": user_id})
-    if not user:
+    try:
+        # Verificar se usuário existe
+        user = await db.user.find_unique(where={"id": user_id})
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Usuário {user_id} não encontrado"
+            )
+        
+        where = {"userId": user_id}
+        
+        if startDate or endDate:
+            where["timestamp"] = {}
+            if startDate:
+                where["timestamp"]["gte"] = startDate
+            if endDate:
+                where["timestamp"]["lte"] = endDate
+        
+        logs = await db.accesslog.find_many(
+            where=where,
+            skip=skip,
+            take=limit,
+            order={"timestamp": "desc"},
+            include={"portal": True}
+        )
+        
+        total = await db.accesslog.count(where=where)
+        
+        formatted_logs = [
+            AccessLogResponse(
+                id=log.id,
+                userId=log.userId,
+                portalId=log.portalId,
+                event=log.event,
+                reason=log.reason,
+                cardValue=log.cardValue,
+                timestamp=log.timestamp,
+                userName=user.name,
+                portalName=log.portal.name if log.portal else None
+            )
+            for log in logs
+        ]
+        
+        return AccessLogListResponse(total=total, logs=formatted_logs)
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Usuário {user_id} não encontrado"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao buscar histórico: {str(e)}"
         )
-    
-    where = {"userId": user_id}
-    
-    if startDate or endDate:
-        where["timestamp"] = {}
-        if startDate:
-            where["timestamp"]["gte"] = startDate
-        if endDate:
-            where["timestamp"]["lte"] = endDate
-    
-    logs = await db.accesslog.find_many(
-        where=where,
-        skip=skip,
-        take=limit,
-        order_by={"timestamp": "desc"},
-        include={"portal": True}
-    )
-    
-    total = await db.accesslog.count(where=where)
-    
-    formatted_logs = [
-        AccessLogResponse(
-            id=log.id,
-            userId=log.userId,
-            portalId=log.portalId,
-            event=log.event,
-            reason=log.reason,
-            cardValue=log.cardValue,
-            timestamp=log.timestamp,
-            userName=user.name,
-            portalName=log.portal.name if log.portal else None
-        )
-        for log in logs
-    ]
-    
-    return AccessLogListResponse(total=total, logs=formatted_logs)
 
 
 # ==================== Portal-specific queries ====================
@@ -462,49 +534,57 @@ async def get_portal_access_history(
     """
     Retorna histórico de acessos de um portal específico
     """
-    # Verificar se portal existe
-    portal = await db.portal.find_unique(where={"id": portal_id})
-    if not portal:
+    try:
+        # Verificar se portal existe
+        portal = await db.portal.find_unique(where={"id": portal_id})
+        if not portal:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Portal {portal_id} não encontrado"
+            )
+        
+        where = {"portalId": portal_id}
+        
+        if startDate or endDate:
+            where["timestamp"] = {}
+            if startDate:
+                where["timestamp"]["gte"] = startDate
+            if endDate:
+                where["timestamp"]["lte"] = endDate
+        
+        logs = await db.accesslog.find_many(
+            where=where,
+            skip=skip,
+            take=limit,
+            order={"timestamp": "desc"},
+            include={"user": True}
+        )
+        
+        total = await db.accesslog.count(where=where)
+        
+        formatted_logs = [
+            AccessLogResponse(
+                id=log.id,
+                userId=log.userId,
+                portalId=log.portalId,
+                event=log.event,
+                reason=log.reason,
+                cardValue=log.cardValue,
+                timestamp=log.timestamp,
+                userName=log.user.name if log.user else None,
+                portalName=portal.name
+            )
+            for log in logs
+        ]
+        
+        return AccessLogListResponse(total=total, logs=formatted_logs)
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Portal {portal_id} não encontrado"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao buscar histórico: {str(e)}"
         )
-    
-    where = {"portalId": portal_id}
-    
-    if startDate or endDate:
-        where["timestamp"] = {}
-        if startDate:
-            where["timestamp"]["gte"] = startDate
-        if endDate:
-            where["timestamp"]["lte"] = endDate
-    
-    logs = await db.accesslog.find_many(
-        where=where,
-        skip=skip,
-        take=limit,
-        order_by={"timestamp": "desc"},
-        include={"user": True}
-    )
-    
-    total = await db.accesslog.count(where=where)
-    
-    formatted_logs = [
-        AccessLogResponse(
-            id=log.id,
-            userId=log.userId,
-            portalId=log.portalId,
-            event=log.event,
-            reason=log.reason,
-            cardValue=log.cardValue,
-            timestamp=log.timestamp,
-            userName=log.user.name if log.user else None,
-            portalName=portal.name
-        )
-        for log in logs
-    ]
-    
-    return AccessLogListResponse(total=total, logs=formatted_logs)
 
 
 # ==================== Recent Activity ====================
@@ -518,37 +598,43 @@ async def get_recent_activity(
     """
     Retorna atividade recente (últimos X minutos)
     """
-    since = datetime.now() - timedelta(minutes=minutes)
-    
-    logs = await db.accesslog.find_many(
-        where={
-            "timestamp": {"gte": since}
-        },
-        take=limit,
-        order_by={"timestamp": "desc"},
-        include={
-            "user": True,
-            "portal": True
+    try:
+        since = datetime.now() - timedelta(minutes=minutes)
+        
+        logs = await db.accesslog.find_many(
+            where={
+                "timestamp": {"gte": since}
+            },
+            take=limit,
+            order={"timestamp": "desc"},
+            include={
+                "user": True,
+                "portal": True
+            }
+        )
+        
+        formatted_logs = [
+            {
+                "id": log.id,
+                "event": log.event,
+                "userName": log.user.name if log.user else "Desconhecido",
+                "portalName": log.portal.name if log.portal else "N/A",
+                "timestamp": log.timestamp,
+                "reason": log.reason
+            }
+            for log in logs
+        ]
+        
+        return {
+            "period": f"Últimos {minutes} minutos",
+            "count": len(formatted_logs),
+            "logs": formatted_logs
         }
-    )
-    
-    formatted_logs = [
-        {
-            "id": log.id,
-            "event": log.event,
-            "userName": log.user.name if log.user else "Desconhecido",
-            "portalName": log.portal.name if log.portal else "N/A",
-            "timestamp": log.timestamp,
-            "reason": log.reason
-        }
-        for log in logs
-    ]
-    
-    return {
-        "period": f"Últimos {minutes} minutos",
-        "count": len(formatted_logs),
-        "logs": formatted_logs
-    }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao buscar atividade recente: {str(e)}"
+        )
 
 
 # ==================== Sync with iDFace ====================
@@ -566,24 +652,27 @@ async def sync_logs_from_idface(db = Depends(get_db)):
             imported_count = 0
             
             for log_data in logs_data:
-                # Verificar se já existe
+                # Verificar se já existe pelo idFaceLogId
+                idface_log_id = log_data.get("id")
+                if not idface_log_id:
+                    continue
+                    
                 existing = await db.accesslog.find_first(
                     where={
-                        "timestamp": log_data.get("timestamp"),
-                        "userId": log_data.get("user_id"),
-                        "portalId": log_data.get("portal_id")
+                        "idFaceLogId": idface_log_id
                     }
                 )
                 
                 if not existing:
                     await db.accesslog.create(
                         data={
+                            "idFaceLogId": idface_log_id,
                             "userId": log_data.get("user_id"),
                             "portalId": log_data.get("portal_id"),
                             "event": log_data.get("event", "unknown"),
                             "reason": log_data.get("reason"),
                             "cardValue": log_data.get("card_value"),
-                            "timestamp": log_data.get("timestamp")
+                            "timestamp": log_data.get("timestamp", datetime.now())
                         }
                     )
                     imported_count += 1

@@ -1,7 +1,7 @@
 """
 Rotas da API para Backup e Restore
 """
-from fastapi import APIRouter, HTTPException, Depends, status, Response
+from fastapi import APIRouter, HTTPException, Depends, status, Response, File, UploadFile, Form
 from fastapi.responses import StreamingResponse
 from app.database import get_db
 from app.services.backup_service import BackupService
@@ -21,14 +21,6 @@ class BackupCreateRequest(BaseModel):
     include_images: bool = Field(False, description="Incluir imagens faciais")
     include_logs: bool = Field(True, description="Incluir logs de acesso")
     compress: bool = Field(True, description="Compactar em ZIP")
-
-
-class BackupRestoreRequest(BaseModel):
-    """Requisição para restaurar backup"""
-    backup_data: str = Field(..., description="Dados do backup em base64")
-    clear_before: bool = Field(False, description="Limpar banco antes")
-    skip_existing: bool = Field(True, description="Pular registros existentes")
-    restore_logs: bool = Field(False, description="Restaurar logs de acesso")
 
 
 class BackupMetadata(BaseModel):
@@ -157,13 +149,16 @@ async def download_backup():
 
 @router.post("/restore", response_model=RestoreResponse)
 async def restore_backup(
-    request: BackupRestoreRequest,
-    db = Depends(get_db)
+    db: any = Depends(get_db),
+    backup_file: UploadFile = File(..., description="Arquivo de backup (.json ou .zip)"),
+    clear_before: bool = Form(False, description="Limpar banco de dados antes de restaurar (CUIDADO!)"),
+    skip_existing: bool = Form(True, description="Pular registros que já existem"),
+    restore_logs: bool = Form(False, description="Incluir restauração de logs de acesso")
 ):
     """
-    Restaura dados a partir de um backup
+    Restaura dados a partir de um arquivo de backup
     
-    - **backup_data**: Dados do backup em base64 (JSON ou ZIP)
+    - **backup_file**: Arquivo de backup (.json ou .zip)
     - **clear_before**: Limpar banco de dados antes de restaurar (CUIDADO!)
     - **skip_existing**: Pular registros que já existem
     - **restore_logs**: Incluir restauração de logs de acesso
@@ -172,21 +167,15 @@ async def restore_backup(
     """
     backup_service = BackupService(db)
     
-    # Decodificar backup
-    try:
-        backup_decoded = base64.b64decode(request.backup_data)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Erro ao decodificar backup: {str(e)}"
-        )
+    # Ler conteúdo do arquivo
+    backup_content = await backup_file.read()
     
     # Restaurar
     result = await backup_service.restore_from_backup(
-        backup_data=backup_decoded,
-        clear_before=request.clear_before,
-        skip_existing=request.skip_existing,
-        restore_logs=request.restore_logs
+        backup_data=backup_content,
+        clear_before=clear_before,
+        skip_existing=skip_existing,
+        restore_logs=restore_logs
     )
     
     if not result["success"]:
@@ -200,8 +189,8 @@ async def restore_backup(
 
 @router.post("/validate")
 async def validate_backup(
-    backup_data: str,
-    db = Depends(get_db)
+    db: any = Depends(get_db),
+    backup_file: UploadFile = File(..., description="Arquivo de backup para validar (.json ou .zip)")
 ):
     """
     Valida a estrutura de um backup sem restaurá-lo
@@ -211,14 +200,14 @@ async def validate_backup(
     backup_service = BackupService(db)
     
     try:
-        backup_decoded = base64.b64decode(backup_data)
+        backup_content = await backup_file.read()
         
         # Tentar descompactar se for ZIP
         try:
-            backup_str = backup_decoded.decode('utf-8')
-        except:
+            backup_str = backup_content.decode('utf-8')
+        except UnicodeDecodeError:
             # Pode ser ZIP
-            backup_str = backup_service._decompress_backup(backup_decoded)
+            backup_str = backup_service._decompress_backup(backup_content)
         
         result = await backup_service.validate_backup(backup_str)
         

@@ -242,7 +242,7 @@ class BackupService:
         """Exporta logs de acesso (limitado)"""
         logs = await self.db.accesslog.find_many(
             take=limit,
-            order_by={"timestamp": "desc"}
+            order={"timestamp": "desc"}
         )
         
         return [

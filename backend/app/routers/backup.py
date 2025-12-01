@@ -1,7 +1,7 @@
 """
 Rotas da API para Backup e Restore
 """
-from fastapi import APIRouter, HTTPException, Depends, status, Response, File, UploadFile, Form
+from fastapi import APIRouter, HTTPException, Depends, status, Response, File, UploadFile, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from app.database import get_db
 from app.services.backup_service import BackupService
@@ -52,7 +52,65 @@ class RestoreResponse(BaseModel):
     statistics: dict
 
 
+# ==================== Funções Auxiliares ====================
+
+async def run_backup_task(db: any, include_images: bool, include_logs: bool, compress: bool):
+    """
+    Executa a criação do backup em background
+    """
+    global _last_backup
+    backup_service = BackupService(db)
+    
+    result = await backup_service.create_full_backup(
+        include_images=include_images,
+        include_logs=include_logs,
+        compress=compress
+    )
+    
+    if result.get("success"):
+        backup_content = result["backup_data"]
+        if isinstance(backup_content, bytes):
+            backup_b64 = base64.b64encode(backup_content).decode('utf-8')
+        else:
+            backup_b64 = base64.b64encode(backup_content.encode('utf-8')).decode('utf-8')
+        
+        _last_backup = {
+            "content": backup_b64,
+            "format": result["format"],
+            "metadata": result["metadata"],
+            "created_at": datetime.now()
+        }
+        print(f"✅ Backup em background concluído com sucesso. Formato: {result['format']}")
+    else:
+        print(f"❌ Erro ao executar backup em background: {result.get('error')}")
+
+
 # ==================== Endpoints ====================
+
+@router.post("/create-async")
+async def create_backup_async(
+    request: BackupCreateRequest,
+    background_tasks: BackgroundTasks,
+    db = Depends(get_db)
+):
+    """
+    Inicia a criação de um backup em background.
+    
+    O processo roda em segundo plano e não bloqueia a resposta.
+    O resultado estará disponível para download em /backup/download assim que finalizado.
+    """
+    background_tasks.add_task(
+        run_backup_task,
+        db,
+        request.include_images,
+        request.include_logs,
+        request.compress
+    )
+    return {
+        "success": True,
+        "message": "Criação de backup iniciada em background. Verifique o status em /backup/info."
+    }
+
 
 @router.post("/create", response_model=BackupResponse)
 async def create_backup(
@@ -60,7 +118,7 @@ async def create_backup(
     db = Depends(get_db)
 ):
     """
-    Cria um backup completo do banco de dados
+    Cria um backup completo do banco de dados e aguarda o resultado.
     
     - **include_images**: Incluir imagens faciais (aumenta muito o tamanho)
     - **include_logs**: Incluir logs de acesso históricos

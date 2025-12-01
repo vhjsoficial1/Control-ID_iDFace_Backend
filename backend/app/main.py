@@ -1,14 +1,104 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import logging
+
+# Configurações e Banco de Dados
 from app.config import settings
-from app.database import connect_db, disconnect_db
+from app.database import db
+from app.services.backup_service import BackupService
+
+# Agendador
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+# Routers
 from app.routers import users, access_rules, time_zones, audit, sync, system, backup, report, realtime, capture, auth
 
+# Configuração de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ==================== Atividade Agendado ====================
+
+async def job_backup_automatico():
+    """
+    Atividade que executa o backup automático do banco de dados.
+    """
+    logger.info("Executando job de backup automático...")
+    try:
+        # Garantir que o banco de dados está conectado
+        if not db.is_connected():
+            await db.connect()
+            logger.info("DB conectado para o job de backup.")
+        
+        # Instanciar o serviço de backup
+        backup_service = BackupService(db)
+        
+        # Criar o backup (apenas logs, sem imagens, compactado)
+        result = await backup_service.create_full_backup(
+            include_images=False,
+            include_logs=True,
+            compress=True
+        )
+        
+        if result.get("success"):
+            metadata = result.get("metadata", {})
+            logger.info(
+                f"✅ Backup automático concluído com sucesso! "
+                f"Tamanho: {metadata.get('size_mb', 'N/A')} MB, "
+                f"Duração: {metadata.get('duration_seconds', 'N/A')}s"
+            )
+        else:
+            logger.error(f"❌ Falha no backup automático: {result.get('error', 'Erro desconhecido')}")
+            
+    except Exception as e:
+        logger.error(f"❌ Erro crítico no job de backup automático: {e}", exc_info=True)
+
+
+# ==================== Ciclo de Vida da Aplicação ====================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Gerencia o ciclo de vida da aplicação, incluindo startup e shutdown.
+    """
+    # --- Startup ---
+    # Conectar ao banco de dados
+    await db.connect()
+    logger.info("✅ Banco de dados conectado.")
+    
+    # Iniciar o agendador de tarefas
+    scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
+    scheduler.add_job(
+        job_backup_automatico,
+        CronTrigger(hour=3, minute=0),  # Executa todo dia às 03:00 AM
+        name="Backup Automático Diário"
+    )
+    scheduler.start()
+    logger.info("✅ Agendador de tarefas iniciado. Job de backup programado para as 03:00.")
+    
+    yield
+    
+    # --- Shutdown ---
+    # Desligar o agendador
+    logger.info("Encerrando agendador de tarefas...")
+    scheduler.shutdown(wait=False)
+    logger.info("✅ Agendador de tarefas encerrado.")
+    
+    # Desconectar do banco de dados
+    await db.disconnect()
+    logger.info("❌ Banco de dados desconectado.")
+
+
+# ==================== Instância da Aplicação ====================
 
 app = FastAPI(
     title=settings.API_TITLE,
     version=settings.API_VERSION,
-    description="API para controle e gerenciamento do leitor facial iDFace"
+    description="API para controle e gerenciamento do leitor facial iDFace",
+    lifespan=lifespan
 )
 
 # CORS middleware
@@ -19,15 +109,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Event handlers
-@app.on_event("startup")
-async def startup():
-    await connect_db()
-
-@app.on_event("shutdown")
-async def shutdown():
-    await disconnect_db()
 
 # Health check
 @app.get("/", tags=["Health"])

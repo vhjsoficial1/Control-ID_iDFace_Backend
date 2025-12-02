@@ -10,6 +10,12 @@ from typing import Optional
 from datetime import datetime
 import io
 import base64
+import logging
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -383,3 +389,289 @@ async def get_database_statistics(db = Depends(get_db)):
 # ==================== Cache Global (Temporário) ====================
 # Em produção, usar Redis ou storage persistente
 _last_backup = None
+
+# Variáveis globais para gerenciar o scheduler
+_backup_scheduler = None
+_scheduler_config = {
+    "enabled": False,
+    "interval_hours": 24,
+    "include_images": False,
+    "include_logs": True,
+    "next_run": None,
+    "last_run": None,
+    "history": []
+}
+
+
+def get_backup_scheduler():
+    """Obtém ou cria instância do scheduler"""
+    global _backup_scheduler
+    if _backup_scheduler is None:
+        _backup_scheduler = AsyncIOScheduler(timezone="America/Sao_Paulo")
+        _backup_scheduler.start()
+    return _backup_scheduler
+
+
+async def scheduled_backup_job():
+    """Job que executa o backup agendado"""
+    global _scheduler_config
+    
+    logger.info("🔄 Executando backup agendado...")
+    
+    try:
+        # Garantir conexão com o banco
+        if not db.is_connected():
+            await db.connect()
+        
+        backup_service = BackupService(db)
+        
+        # Criar backup com configurações salvas
+        result = await backup_service.create_full_backup(
+            include_images=_scheduler_config["include_images"],
+            include_logs=_scheduler_config["include_logs"],
+            compress=True
+        )
+        
+        if result.get("success"):
+            # Salvar no cache global
+            backup_content = result["backup_data"]
+            if isinstance(backup_content, bytes):
+                backup_b64 = base64.b64encode(backup_content).decode('utf-8')
+            else:
+                backup_b64 = base64.b64encode(backup_content.encode('utf-8')).decode('utf-8')
+            
+            global _last_backup
+            _last_backup = {
+                "content": backup_b64,
+                "format": result["format"],
+                "metadata": result["metadata"],
+                "created_at": datetime.now()
+            }
+            
+            # Atualizar histórico
+            _scheduler_config["last_run"] = datetime.now().isoformat()
+            _scheduler_config["history"].insert(0, {
+                "timestamp": datetime.now().isoformat(),
+                "size_mb": result["metadata"]["size_mb"],
+                "duration": result["metadata"]["duration_seconds"],
+                "success": True
+            })
+            
+            # Manter apenas últimos 10 registros
+            _scheduler_config["history"] = _scheduler_config["history"][:10]
+            
+            logger.info(
+                f"✅ Backup agendado concluído! "
+                f"Tamanho: {result['metadata']['size_mb']} MB"
+            )
+        else:
+            logger.error(f"❌ Falha no backup agendado: {result.get('error')}")
+            
+            _scheduler_config["history"].insert(0, {
+                "timestamp": datetime.now().isoformat(),
+                "error": result.get("error"),
+                "success": False
+            })
+            
+    except Exception as e:
+        logger.error(f"❌ Erro crítico no backup agendado: {e}", exc_info=True)
+        
+        _scheduler_config["history"].insert(0, {
+            "timestamp": datetime.now().isoformat(),
+            "error": str(e),
+            "success": False
+        })
+
+
+@router.get("/scheduler/status")
+async def get_scheduler_status():
+    """
+    Retorna o status atual do scheduler de backup
+    """
+    global _scheduler_config
+    
+    scheduler = get_backup_scheduler()
+    jobs = scheduler.get_jobs()
+    
+    # Buscar o job de backup
+    backup_job = None
+    for job in jobs:
+        if job.id == "scheduled_backup":
+            backup_job = job
+            break
+    
+    next_run = None
+    if backup_job and backup_job.next_run_time:
+        next_run = backup_job.next_run_time.isoformat()
+        _scheduler_config["next_run"] = next_run
+    
+    return {
+        "success": True,
+        "enabled": _scheduler_config["enabled"],
+        "intervalHours": _scheduler_config["interval_hours"],
+        "includeImages": _scheduler_config["include_images"],
+        "includeLogs": _scheduler_config["include_logs"],
+        "nextRun": next_run or _scheduler_config.get("next_run"),
+        "lastRun": _scheduler_config.get("last_run"),
+        "scheduledTime": "03:00" if _scheduler_config["interval_hours"] == 24 else None,
+        "history": _scheduler_config.get("history", [])
+    }
+
+
+@router.post("/scheduler/enable")
+async def enable_scheduler(
+    interval_hours: int = 24,
+    include_images: bool = False,
+    include_logs: bool = True
+):
+    """
+    Habilita o scheduler de backup automático
+    
+    - **interval_hours**: Intervalo em horas entre backups
+    - **include_images**: Incluir imagens faciais
+    - **include_logs**: Incluir logs de acesso
+    """
+    global _scheduler_config
+    
+    try:
+        scheduler = get_backup_scheduler()
+        
+        # Remover job existente se houver
+        if scheduler.get_job("scheduled_backup"):
+            scheduler.remove_job("scheduled_backup")
+        
+        # Atualizar configurações
+        _scheduler_config["enabled"] = True
+        _scheduler_config["interval_hours"] = interval_hours
+        _scheduler_config["include_images"] = include_images
+        _scheduler_config["include_logs"] = include_logs
+        
+        # Criar trigger baseado no intervalo
+        if interval_hours == 24:
+            # Backup diário às 03:00
+            trigger = CronTrigger(hour=3, minute=0, timezone="America/Sao_Paulo")
+        else:
+            # Intervalo personalizado
+            trigger = IntervalTrigger(hours=interval_hours, timezone="America/Sao_Paulo")
+        
+        # Adicionar job
+        job = scheduler.add_job(
+            scheduled_backup_job,
+            trigger=trigger,
+            id="scheduled_backup",
+            name="Backup Automático",
+            replace_existing=True
+        )
+        
+        next_run = job.next_run_time.isoformat() if job.next_run_time else None
+        _scheduler_config["next_run"] = next_run
+        
+        logger.info(
+            f"✅ Scheduler habilitado: "
+            f"intervalo={interval_hours}h, "
+            f"próxima execução={next_run}"
+        )
+        
+        return {
+            "success": True,
+            "message": "Backup automático habilitado",
+            "nextRun": next_run,
+            "config": {
+                "interval_hours": interval_hours,
+                "include_images": include_images,
+                "include_logs": include_logs
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Erro ao habilitar scheduler: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.post("/scheduler/disable")
+async def disable_scheduler():
+    """
+    Desabilita o scheduler de backup automático
+    """
+    global _scheduler_config
+    
+    try:
+        scheduler = get_backup_scheduler()
+        
+        # Remover job
+        if scheduler.get_job("scheduled_backup"):
+            scheduler.remove_job("scheduled_backup")
+            logger.info("✅ Scheduler desabilitado")
+        
+        _scheduler_config["enabled"] = False
+        _scheduler_config["next_run"] = None
+        
+        return {
+            "success": True,
+            "message": "Backup automático desabilitado"
+        }
+        
+    except Exception as e:
+        logger.error(f"Erro ao desabilitar scheduler: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.post("/scheduler/run-now")
+async def run_backup_now(db = Depends(get_db)):
+    """
+    Executa o backup agendado imediatamente (sem esperar próximo ciclo)
+    """
+    try:
+        logger.info("🔄 Executando backup manual via scheduler...")
+        
+        await scheduled_backup_job()
+        
+        # Buscar último backup criado
+        global _last_backup
+        if _last_backup:
+            return {
+                "success": True,
+                "message": "Backup executado com sucesso",
+                "size_mb": _last_backup.get("metadata", {}).get("size_mb"),
+                "format": _last_backup.get("format")
+            }
+        
+        return {
+            "success": True,
+            "message": "Backup executado"
+        }
+        
+    except Exception as e:
+        logger.error(f"Erro ao executar backup: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@router.get("/scheduler/next-run")
+async def get_next_run():
+    """
+    Retorna data/hora da próxima execução agendada
+    """
+    scheduler = get_backup_scheduler()
+    job = scheduler.get_job("scheduled_backup")
+    
+    if not job:
+        return {
+            "success": False,
+            "message": "Nenhum backup agendado"
+        }
+    
+    return {
+        "success": True,
+        "nextRun": job.next_run_time.isoformat() if job.next_run_time else None,
+        "jobId": job.id,
+        "jobName": job.name
+    }

@@ -14,6 +14,7 @@ import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from app.database import get_db, db
 
 logger = logging.getLogger(__name__)
 
@@ -419,13 +420,11 @@ async def scheduled_backup_job():
     logger.info("🔄 Executando backup agendado...")
     
     try:
-        # Garantir conexão com o banco
         if not db.is_connected():
             await db.connect()
         
         backup_service = BackupService(db)
         
-        # Criar backup com configurações salvas
         result = await backup_service.create_full_backup(
             include_images=_scheduler_config["include_images"],
             include_logs=_scheduler_config["include_logs"],
@@ -513,7 +512,7 @@ async def get_scheduler_status():
         "includeLogs": _scheduler_config["include_logs"],
         "nextRun": next_run or _scheduler_config.get("next_run"),
         "lastRun": _scheduler_config.get("last_run"),
-        "scheduledTime": "03:00" if _scheduler_config["interval_hours"] == 24 else None,
+        "scheduledTime": "09:10" if _scheduler_config["interval_hours"] == 24 else None,
         "history": _scheduler_config.get("history", [])
     }
 
@@ -548,8 +547,8 @@ async def enable_scheduler(
         
         # Criar trigger baseado no intervalo
         if interval_hours == 24:
-            # Backup diário às 03:00
-            trigger = CronTrigger(hour=3, minute=0, timezone="America/Sao_Paulo")
+            # Backup diário às 09:10
+            trigger = CronTrigger(hour=9, minute=10, timezone="America/Sao_Paulo")
         else:
             # Intervalo personalizado
             trigger = IntervalTrigger(hours=interval_hours, timezone="America/Sao_Paulo")

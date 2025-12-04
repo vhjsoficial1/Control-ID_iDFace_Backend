@@ -89,3 +89,17 @@ async def monitor_full_status(
     """
     service = RealtimeMonitorService(db)
     return await service.monitor_full_status(since_id)
+
+@router.get("/device-info")
+async def get_device_info(db = Depends(get_db)):
+    """
+    Retorna informações do dispositivo iDFace conectado
+    
+    **Retorna:**
+    - ID do dispositivo
+    - Nome do dispositivo
+    - Status de conectividade
+    - Última comunicação
+    """
+    service = RealtimeMonitorService(db)
+    return await service.get_device_info()

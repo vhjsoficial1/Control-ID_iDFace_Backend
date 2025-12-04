@@ -448,3 +448,98 @@ class RealtimeMonitorService:
             },
             "deviceStatus": "online" if alarm_status.get("success") else "offline"
         }
+    
+
+    async def get_device_info(self) -> Dict[str, Any]:
+        """
+        Obtém informações do dispositivo iDFace conectado
+        Tenta buscar info do device, mas se falhar, verifica    conectividade básica
+        """
+        try:
+            async with idface_client:
+                # Método 1: Tentar buscar configurações do sistema
+                try:
+                    result = await idface_client.request(
+                        "POST",
+                        "system_information.fcgi"
+                    )
+                    
+                    if result:
+                        return {
+                            "success": True,
+                            "connected": True,
+                            "device": {
+                                "id": result.get("device_id", 1),
+                                "name": result.get("device_name",   "iDFace"),
+                                "ip": idface_client.base_url.replace    ("http://", "").replace("https://", ""),
+                                "model": result.get("model", "iDFace"),
+                                "serial": result.get("serial_number",   "N/A"),
+                                "firmware": result.get  ("firmware_version", "N/A")
+                            },
+                            "lastCommunication": datetime.now().    isoformat()
+                        }
+                except:
+                    pass
+                
+                # Método 2: Verificar status de alarme (endpoint mais   simples)
+                try:
+                    result = await idface_client.request(
+                        "POST",
+                        "alarm_status.fcgi"
+                    )
+                    
+                    # Se chegou aqui, o dispositivo está respondendo
+                    return {
+                        "success": True,
+                        "connected": True,
+                        "device": {
+                            "id": 1,  # ID padrão quando não    conseguimos buscar
+                            "name": "iDFace",
+                            "ip": idface_client.base_url.replace    ("http://", "").replace("https://", ""),
+                            "model": "iDFace Biométrico",
+                            "serial": "N/A"
+                        },
+                        "lastCommunication": datetime.now().isoformat()
+                    }
+                except:
+                    pass
+                
+                # Método 3: Buscar pela contagem de logs (último    recurso)
+                try:
+                    result = await idface_client.request(
+                        "POST",
+                        "load_objects.fcgi",
+                        json={
+                            "object": "access_logs",
+                            "fields": ["COUNT(*)"],
+                            "where": []
+                        }
+                    )
+                    
+                    # Se chegou aqui, está online
+                    return {
+                        "success": True,
+                        "connected": True,
+                        "device": {
+                            "id": 1,
+                            "name": "iDFace",
+                            "ip": idface_client.base_url.replace    ("http://", "").replace("https://", ""),
+                            "model": "iDFace",
+                            "serial": "N/A"
+                        },
+                        "lastCommunication": datetime.now().isoformat()
+                    }
+                except:
+                    pass
+                
+                # Se nenhum método funcionou
+                raise Exception("Não foi possível conectar ao   dispositivo")
+                    
+        except Exception as e:
+            logger.error(f"Erro ao obter info do dispositivo: {e}")
+            return {
+                "success": False,
+                "connected": False,
+                "error": str(e),
+                "device": None
+            }

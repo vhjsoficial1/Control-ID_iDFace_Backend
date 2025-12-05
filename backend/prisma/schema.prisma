@@ -28,7 +28,7 @@ model User {
   id              Int       @id @default(autoincrement())
   idFaceId        Int?      @unique
   name            String
-  registration    String?   @unique
+  registration    String?
   password        String?
   salt            String?
   beginTime       DateTime?

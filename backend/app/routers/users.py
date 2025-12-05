@@ -27,16 +27,26 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
     3. Busca o ID correto no leitor
     4. Atualiza o banco local com o ID do leitor
     5. Envia a imagem se fornecida
+    
+    IMPORTANTE: Matrícula é obrigatória mas pode ser duplicada entre usuários
     """
     user_service = UserService(db)
     
     # Guardar imagem temporariamente
     temp_image = user.image
     
+    registration_value = user.registration.strip() if user.registration else ""
+    
+    if not registration_value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Matrícula é obrigatória"
+        )
+    
     # 1. Criar usuário localmente primeiro (SEM imagem inicialmente)
     create_result = await user_service.create_user(
         name=user.name,
-        registration=user.registration or None,
+        registration=registration_value,  # Matrícula obrigatória
         password=user.password,
         begin_time=user.beginTime,
         end_time=user.endTime,
@@ -57,10 +67,23 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
             # Criar usuário no leitor
             idface_data = {
                 "name": new_user.name,
-                "registration": new_user.registration or "",
+                "registration": new_user.registration,  # Sempre tem valor agora
                 "password": new_user.password or "",
                 "salt": new_user.salt or ""
             }
+
+            # Só envia registration se não for None e não for string vazia
+            if new_user.registration:
+                idface_data["registration"] = new_user.registration
+
+            # Só envia password se não for None e não for string vazia
+            if new_user.password:
+                idface_data["password"] = new_user.password
+
+            # Só envia salt se realmente existir
+            if new_user.salt:
+                idface_data["salt"] = new_user.salt
+
             
             await idface_client.create_user(idface_data)
             
@@ -68,12 +91,16 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
             await asyncio.sleep(0.5)
             
             # Buscar usuário no leitor para confirmar os dados
-            search_result = await idface_client.load_users(where={
-                "users": {
-                    "name": new_user.name,
-                    "registration": new_user.registration
-                }
-            })
+            where_query = {"name": new_user.name}
+
+            # Só filtra por registration se existir
+            if new_user.registration:
+                where_query["registration"] = new_user.registration
+
+            search_result = await idface_client.load_users(
+                where={"users": where_query}
+            )
+
             
             idface_users = search_result.get("users", [])
             if not idface_users:

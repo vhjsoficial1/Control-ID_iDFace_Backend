@@ -43,14 +43,12 @@ class UserService:
         if len(name) > 255:
             validation_errors.append("Nome não pode ter mais de 255 caracteres")
         
-        # Validar matrícula única
-        if registration:
-            existing = await self.db.user.find_first(
-                where={"registration": registration}
-            )
-            if existing:
-                validation_errors.append(f"Matrícula '{registration}' já está em uso")
         
+        if registration is not None and registration.strip() == "":
+            registration = None
+        if password is not None and password.strip() == "":
+            password = None
+
         # Validar datas
         if begin_time and end_time:
             if end_time <= begin_time:
@@ -131,17 +129,11 @@ class UserService:
                 update_data["name"] = name.strip()
         
         if registration is not None:
-            # Verificar se matrícula já existe em outro usuário
-            existing = await self.db.user.find_first(
-                where={
-                    "registration": registration,
-                    "id": {"not": user_id}
-                }
-            )
-            if existing:
-                validation_errors.append(f"Matrícula '{registration}' já está em uso")
+            if registration.strip() == "":
+                registration = None
             else:
                 update_data["registration"] = registration
+
         
         if begin_time is not None:
             update_data["beginTime"] = begin_time

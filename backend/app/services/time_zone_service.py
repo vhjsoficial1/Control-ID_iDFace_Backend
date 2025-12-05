@@ -19,21 +19,11 @@ class TimeZoneService:
         time_spans_data: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
-        Cria um time zone no banco local e sincroniza com o iDFace.
-        Se a sincronização falhar, a criação local é desfeita (rollback).
-        
-        Args:
-            db: Instância do banco de dados Prisma
-            name: Nome do time zone
-            time_spans_data: Lista de time spans a criar
-            
-        Returns:
-            Dicionário com dados do time zone criado
-            
-        Raises:
-            HTTPException: Se houver erro na criação ou sincronização
+        Cria um time zone e ASSOCIA AUTOMATICAMENTE aos portais existentes via AccessRule
         """
         new_tz = None
+        new_access_rule = None
+        
         try:
             # 1. Criar time zone no banco de dados local
             new_tz = await db.timezone.create(data={"name": name})
@@ -42,7 +32,6 @@ class TimeZoneService:
             idface_id = None
             try:
                 async with idface_client:
-                    # Criar o time zone no iDFace
                     tz_payload = {"name": name}
                     result_tz = await idface_client.create_time_zone(tz_payload)
                     
@@ -51,7 +40,6 @@ class TimeZoneService:
                     
                     idface_id = result_tz["ids"][0]
                     
-                    # Atualizar o time zone local com o idFaceId
                     await db.timezone.update(
                         where={"id": new_tz.id},
                         data={"idFaceId": idface_id}
@@ -60,21 +48,19 @@ class TimeZoneService:
                     # 3. Criar e sincronizar time spans, se houver
                     if time_spans_data:
                         for span_data in time_spans_data:
-                            # Criar no banco local
                             local_span = await db.timespan.create(
                                 data={
                                     "timeZoneId": new_tz.id,
                                     **span_data
                                 }
                             )
-                            # Sincronizar com o iDFace
+                            
                             span_payload = TimeZoneService._prepare_span_payload_for_idface(
                                 idface_id,
                                 span_data
                             )
                             result_span = await idface_client.create_time_span(span_payload)
                             
-                            # Atualizar o span local com o idFaceId
                             if result_span.get("ids"):
                                 span_idface_id = result_span["ids"][0]
                                 await db.timespan.update(
@@ -83,7 +69,6 @@ class TimeZoneService:
                                 )
             
             except Exception as sync_error:
-                # Se a sincronização falhar, deletar o time zone criado localmente
                 if new_tz:
                     await db.timezone.delete(where={"id": new_tz.id})
                 raise HTTPException(
@@ -91,7 +76,99 @@ class TimeZoneService:
                     detail=f"Erro ao sincronizar com iDFace: {str(sync_error)}"
                 )
             
-            # Recarregar com os dados completos para a resposta
+            # ✅ 4. NOVO: CRIAR ACCESS RULE AUTOMÁTICA PARA O TIME ZONE
+            access_rule_name = f"Access Rule for TimeZone: {name}"
+            new_access_rule = await db.accessrule.create(
+                data={
+                    "name": access_rule_name,
+                    "type": 1,
+                    "priority": 5
+                }
+            )
+            
+            # Sincronizar AccessRule com iDFace
+            try:
+                async with idface_client:
+                    ar_result = await idface_client.create_access_rule({
+                        "name": access_rule_name,
+                        "type": 1,
+                        "priority": 5
+                    })
+                    
+                    ar_ids = ar_result.get("ids", [])
+                    if ar_ids:
+                        new_access_rule = await db.accessrule.update(
+                            where={"id": new_access_rule.id},
+                            data={"idFaceId": ar_ids[0]}
+                        )
+            except Exception as e:
+                print(f"Aviso: Erro ao sincronizar AccessRule: {e}")
+            
+            # 5. Vincular TimeZone à AccessRule
+            await db.accessruletimezone.create(
+                data={
+                    "accessRuleId": new_access_rule.id,
+                    "timeZoneId": new_tz.id
+                }
+            )
+            
+            # Sincronizar vínculo no iDFace
+            if new_access_rule.idFaceId and idface_id:
+                try:
+                    async with idface_client:
+                        await idface_client.request(
+                            "POST",
+                            "create_objects.fcgi",
+                            json={
+                                "object": "access_rule_time_zones",
+                                "values": [{
+                                    "access_rule_id": new_access_rule.idFaceId,
+                                    "time_zone_id": idface_id
+                                }]
+                            }
+                        )
+                except Exception as e:
+                    print(f"Aviso: Erro ao sincronizar TimeZone-AccessRule: {e}")
+            
+            # ✅ 6. NOVO: ASSOCIAR AUTOMATICAMENTE A TODOS OS PORTAIS
+            all_portals = await db.portal.find_many()
+            
+            portals_associated = 0
+            for portal in all_portals:
+                try:
+                    # Criar vínculo local
+                    await db.portalaccessrule.create(
+                        data={
+                            "portalId": portal.id,
+                            "accessRuleId": new_access_rule.id
+                        }
+                    )
+                    portals_associated += 1
+                    
+                    # Sincronizar com iDFace
+                    if portal.idFaceId and new_access_rule.idFaceId:
+                        try:
+                            async with idface_client:
+                                await idface_client.request(
+                                    "POST",
+                                    "create_objects.fcgi",
+                                    json={
+                                        "object": "portal_access_rules",
+                                        "values": [{
+                                            "portal_id": portal.idFaceId,
+                                            "access_rule_id": new_access_rule.idFaceId
+                                        }]
+                                    }
+                                )
+                        except Exception as e:
+                            print(f"Aviso: Erro ao sincronizar portal {portal.id}: {e}")
+                
+                except Exception as e:
+                    print(f"Aviso: Erro ao associar portal {portal.id}: {e}")
+            
+            print(f"✅ TimeZone criado e associado a {portals_associated} portal(is)")
+            
+            # Recarregar com os dados completos
             result = await db.timezone.find_unique(
                 where={"id": new_tz.id},
                 include={"timeSpans": True}
@@ -99,9 +176,18 @@ class TimeZoneService:
             return result
         
         except Exception as e:
-            # Captura outras exceções que não sejam de sincronização
+            # Rollback em caso de erro
+            if new_access_rule:
+                try:
+                    await db.accessrule.delete(where={"id": new_access_rule.id})
+                except:
+                    pass
+            
             if new_tz and not getattr(new_tz, 'idFaceId', None):
-                await db.timezone.delete(where={"id": new_tz.id})
+                try:
+                    await db.timezone.delete(where={"id": new_tz.id})
+                except:
+                    pass
             
             if isinstance(e, HTTPException):
                 raise e

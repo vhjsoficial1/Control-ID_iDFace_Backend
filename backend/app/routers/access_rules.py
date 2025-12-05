@@ -506,7 +506,7 @@ async def list_portals_in_rule(rule_id: int, db = Depends(get_db)):
 @router.post("/groups/", response_model=GroupResponse, status_code=status.HTTP_201_CREATED)
 async def create_group(group: GroupCreate, db = Depends(get_db)):
     """
-    Cria grupo de usuários, opcionalmente os associa e vincula a um time zone via AccessRule.
+    Cria grupo de usuários e ASSOCIA AUTOMATICAMENTE aos portais existentes
     """
     try:
         # 1. Criar grupo no banco local
@@ -534,22 +534,109 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
                     )
         except Exception as e:
             print(f"Aviso: Erro ao sincronizar grupo com iDFace: {e}")
-            # Não falhar a criação do grupo local se a sincronização falhar
         
-        # 3. Associar usuários se fornecidos
+        # 3. Criar AccessRule para o grupo
+        access_rule_name = f"Access Rule for Group: {new_group.name}"
+        new_access_rule = await db.accessrule.create(
+            data={
+                "name": access_rule_name,
+                "type": 1,
+                "priority": 10
+            }
+        )
+        
+        # 4. Sincronizar AccessRule com iDFace
+        try:
+            async with idface_client:
+                idface_ar_result = await idface_client.create_access_rule({
+                    "name": access_rule_name,
+                    "type": 1,
+                    "priority": 10
+                })
+                idface_ar_ids = idface_ar_result.get("ids", [])
+                if idface_ar_ids:
+                    new_access_rule = await db.accessrule.update(
+                        where={"id": new_access_rule.id},
+                        data={"idFaceId": idface_ar_ids[0]}
+                    )
+        except Exception as e:
+            print(f"Aviso: Erro ao sincronizar AccessRule com iDFace: {e}")
+        
+        # 5. Vincular o grupo à AccessRule
+        await db.groupaccessrule.create(
+            data={
+                "groupId": new_group.id,
+                "accessRuleId": new_access_rule.id
+            }
+        )
+        
+        # Sincronizar vínculo Group-AccessRule no iDFace
+        if new_group.idFaceId and new_access_rule.idFaceId:
+            try:
+                async with idface_client:
+                    await idface_client.request(
+                        "POST",
+                        "create_objects.fcgi",
+                        json={
+                            "object": "group_access_rules",
+                            "values": [{
+                                "group_id": new_group.idFaceId,
+                                "access_rule_id": new_access_rule.idFaceId
+                            }]
+                        }
+                    )
+            except Exception as e:
+                print(f"Aviso: Erro ao sincronizar Group-AccessRule: {e}")
+        
+        # ✅ 6. NOVO: ASSOCIAR AUTOMATICAMENTE A TODOS OS PORTAIS EXISTENTES
+        all_portals = await db.portal.find_many()
+        
+        portals_associated = 0
+        for portal in all_portals:
+            try:
+                # Criar vínculo local Portal-AccessRule
+                await db.portalaccessrule.create(
+                    data={
+                        "portalId": portal.id,
+                        "accessRuleId": new_access_rule.id
+                    }
+                )
+                portals_associated += 1
+                
+                # Sincronizar vínculo no iDFace
+                if portal.idFaceId and new_access_rule.idFaceId:
+                    try:
+                        async with idface_client:
+                            await idface_client.request(
+                                "POST",
+                                "create_objects.fcgi",
+                                json={
+                                    "object": "portal_access_rules",
+                                    "values": [{
+                                        "portal_id": portal.idFaceId,
+                                        "access_rule_id": new_access_rule.idFaceId
+                                    }]
+                                }
+                            )
+                    except Exception as e:
+                        print(f"Aviso: Erro ao sincronizar portal {portal.id} com iDFace: {e}")
+            
+            except Exception as e:
+                print(f"Aviso: Erro ao associar portal {portal.id}: {e}")
+        
+        print(f"✅ Grupo criado e associado a {portals_associated} portal(is)")
+        
+        # 7. Associar usuários se fornecidos
         if group.userIds:
             for user_id in group.userIds:
                 user = await db.user.find_unique(where={"id": user_id})
                 if not user:
-                    print(f"Aviso: Usuário {user_id} não encontrado, pulando associação.")
                     continue
                 
-                # Criar vínculo local
                 await db.usergroup.create(
                     data={"userId": user.id, "groupId": new_group.id}
                 )
                 
-                # Sincronizar vínculo com iDFace (se ambos estiverem sincronizados)
                 if new_group.idFaceId and user.idFaceId:
                     try:
                         async with idface_client:
@@ -557,7 +644,7 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
                                 "POST",
                                 "create_objects.fcgi",
                                 json={
-                                    "object": "user_groups", # Assumindo que 'user_groups' é um objeto válido para criação
+                                    "object": "user_groups",
                                     "values": [{
                                         "user_id": user.idFaceId,
                                         "group_id": new_group.idFaceId
@@ -565,9 +652,9 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
                                 }
                             )
                     except Exception as e:
-                        print(f"Aviso: Erro ao sincronizar vínculo de usuário {user.id} com grupo {new_group.id} no iDFace: {e}")
+                        print(f"Aviso: Erro ao sincronizar usuário {user.id}: {e}")
         
-        # 4. Vincular a um TimeZone via AccessRule se fornecido
+        # 8. Vincular TimeZone se fornecido
         if group.timeZoneId:
             time_zone = await db.timezone.find_unique(where={"id": group.timeZoneId})
             if not time_zone:
@@ -576,34 +663,7 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
                     detail=f"Time Zone {group.timeZoneId} não encontrado."
                 )
             
-            # Criar uma nova AccessRule para este grupo e TimeZone
-            access_rule_name = f"Access Rule for Group: {new_group.name}"
-            new_access_rule = await db.accessrule.create(
-                data={
-                    "name": access_rule_name,
-                    "type": 1, # Default type
-                    "priority": 0 # Default priority
-                }
-            )
-            
-            # Sincronizar AccessRule com iDFace
-            try:
-                async with idface_client:
-                    idface_ar_result = await idface_client.create_access_rule({
-                        "name": access_rule_name,
-                        "type": 1,
-                        "priority": 0
-                    })
-                    idface_ar_ids = idface_ar_result.get("ids", [])
-                    if idface_ar_ids:
-                        new_access_rule = await db.accessrule.update(
-                            where={"id": new_access_rule.id},
-                            data={"idFaceId": idface_ar_ids[0]}
-                        )
-            except Exception as e:
-                print(f"Aviso: Erro ao sincronizar AccessRule para grupo com iDFace: {e}")
-            
-            # Vincular TimeZone à nova AccessRule localmente
+            # Vincular TimeZone à AccessRule
             await db.accessruletimezone.create(
                 data={
                     "accessRuleId": new_access_rule.id,
@@ -611,7 +671,7 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
                 }
             )
             
-            # Sincronizar vínculo TimeZone-AccessRule com iDFace
+            # Sincronizar vínculo no iDFace
             if new_access_rule.idFaceId and time_zone.idFaceId:
                 try:
                     async with idface_client:
@@ -627,33 +687,7 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
                             }
                         )
                 except Exception as e:
-                    print(f"Aviso: Erro ao sincronizar vínculo TimeZone-AccessRule com iDFace: {e}")
-            
-            # Vincular o novo grupo à nova AccessRule localmente
-            await db.groupaccessrule.create(
-                data={
-                    "groupId": new_group.id,
-                    "accessRuleId": new_access_rule.id
-                }
-            )
-            
-            # Sincronizar vínculo Group-AccessRule com iDFace
-            if new_group.idFaceId and new_access_rule.idFaceId:
-                try:
-                    async with idface_client:
-                        await idface_client.request(
-                            "POST",
-                            "create_objects.fcgi",
-                            json={
-                                "object": "group_access_rules",
-                                "values": [{
-                                    "group_id": new_group.idFaceId,
-                                    "access_rule_id": new_access_rule.idFaceId
-                                }]
-                            }
-                        )
-                except Exception as e:
-                    print(f"Aviso: Erro ao sincronizar vínculo Group-AccessRule com iDFace: {e}")
+                    print(f"Aviso: Erro ao sincronizar TimeZone-AccessRule: {e}")
         
         return new_group
         
@@ -662,7 +696,6 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Erro ao criar grupo: {str(e)}"
         )
-
 
 @router.get("/groups/", response_model=List[GroupResponse])
 async def list_groups(db = Depends(get_db)):

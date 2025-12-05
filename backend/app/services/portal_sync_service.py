@@ -1,158 +1,106 @@
-"""
-Serviço de sincronização de portais/áreas do dispositivo iDFace com o banco de dados
-Sincroniza os portais configurados no leitor com a tabela de portais do PostgreSQL
-"""
-from typing import Dict, List, Any
+from app.database import db, connect_db, disconnect_db
 from app.utils.idface_client import idface_client
-from app.database import db
 import logging
 
 logger = logging.getLogger(__name__)
 
-
 class PortalSyncService:
-    """Sincroniza portais do iDFace com o banco de dados local"""
-    
-    def __init__(self):
-        self.db = db
-    
-    async def sync_portals_from_device(self) -> Dict[str, Any]:
-        """
-        Sincroniza portais do dispositivo iDFace com o banco de dados
-        Obtém todas as áreas/portais do leitor e salva/atualiza no banco
-        
-        Returns:
-            {
-                "success": bool,
-                "synced": int,  # quantidade sincronizada
-                "created": int,
-                "updated": int,
-                "portals": [...]
-            }
-        """
+    async def ensure_connection(self):
+        """Garante que a conexão com o banco esteja ativa"""
         try:
-            logger.info("Iniciando sincronização de portais...")
+            if not db.is_connected():
+                print("🔌 Conectando ao banco de dados...")
+                await connect_db()
+                print("✅ Banco de dados conectado.")
+        except Exception as e:
+            print(f"❌ Erro ao conectar ao banco: {e}")
+            raise e
+
+    async def sync_portals_from_device(self):
+        """
+        Busca áreas no iDFace e atualiza a tabela Portal no banco local
+        """
+        stats = {"synced": 0, "created": 0, "updated": 0, "portals": []}
+        
+        try:
+            # 1. Garantir conexão
+            await self.ensure_connection()
+
+            # 2. Buscar áreas no dispositivo
+            print("📡 Buscando dados no equipamento (load_objects)...")
+            response = await idface_client.request("POST", "load_objects.fcgi", json={"object": "areas"})
+            areas = response.get("areas", [])
             
-            # 1. Buscar TODAS as áreas do dispositivo
-            async with idface_client:
-                result = await idface_client.load_areas()
-            
-            device_areas = result.get("areas", [])
-            logger.info(f"Encontrados {len(device_areas)} portais no dispositivo")
-            
-            if not device_areas:
-                return {
-                    "success": True,
-                    "synced": 0,
-                    "created": 0,
-                    "updated": 0,
-                    "message": "Nenhuma área encontrada no dispositivo",
-                    "portals": []
-                }
-            
-            # 2. Processar cada área
-            created = 0
-            updated = 0
-            synced_portals = []
-            
-            for area in device_areas:
+            if not areas:
+                return {"success": False, "error": "Nenhuma área encontrada no dispositivo"}
+
+            print(f"📋 Encontradas {len(areas)} áreas no equipamento.")
+
+            # 3. Sincronizar com o banco local
+            for area in areas:
                 area_id = area.get("id")
-                area_name = area.get("name", f"Portal {area_id}")
+                area_name = area.get("name")
                 
-                if not area_id:
-                    logger.warning(f"Área sem ID: {area}")
-                    continue
-                
+                if not area_id: continue
+
                 try:
-                    # 3. Verificar se portal já existe no banco
-                    existing_portal = await self.db.portal.find_unique(
-                        where={"idFaceId": area_id}
-                    )
+                    # Tenta achar pelo ID do iDFace
+                    # Nota: O campo no banco é idFaceId para mapear com o ID externo
+                    existing = await db.portal.find_first(where={"idFaceId": area_id})
                     
-                    if existing_portal:
-                        # Atualizar nome se mudou
-                        if existing_portal.name != area_name:
-                            updated_portal = await self.db.portal.update(
-                                where={"idFaceId": area_id},
+                    status = "unchanged"
+                    
+                    if existing:
+                        if existing.name != area_name:
+                            await db.portal.update(
+                                where={"id": existing.id},
                                 data={"name": area_name}
                             )
-                            updated += 1
-                            logger.info(f"Portal #{area_id} atualizado: {area_name}")
-                        else:
-                            logger.debug(f"Portal #{area_id} já existe e sem mudanças")
+                            status = "updated"
+                            stats["updated"] += 1
                     else:
-                        # Criar novo portal
-                        new_portal = await self.db.portal.create(
+                        await db.portal.create(
                             data={
                                 "idFaceId": area_id,
                                 "name": area_name
                             }
                         )
-                        created += 1
-                        logger.info(f"Portal #{area_id} criado: {area_name}")
+                        status = "created"
+                        stats["created"] += 1
                     
-                    synced_portals.append({
-                        "id": area_id,
-                        "name": area_name,
-                        "status": "created" if not existing_portal else "updated" if existing_portal.name != area_name else "unchanged"
+                    stats["synced"] += 1
+                    stats["portals"].append({
+                        "id": area_id, 
+                        "name": area_name, 
+                        "status": status
                     })
-                
-                except Exception as e:
-                    logger.error(f"Erro ao processar portal #{area_id}: {e}")
-                    continue
-            
-            total_synced = len(synced_portals)
-            
-            logger.info(f"✅ Sincronização concluída: {total_synced} portais, {created} criados, {updated} atualizados")
-            
-            return {
-                "success": True,
-                "synced": total_synced,
-                "created": created,
-                "updated": updated,
-                "portals": synced_portals
-            }
-        
+                except Exception as e_inner:
+                    print(f"❌ Erro ao processar portal #{area_id}: {e_inner}")
+                    # Tenta reconectar se o erro for de conexão perdida
+                    if "Client is not connected" in str(e_inner):
+                        await self.ensure_connection()
+
+            return {"success": True, **stats}
+
         except Exception as e:
-            logger.error(f"❌ Erro na sincronização de portais: {e}")
-            import traceback
-            traceback.print_exc()
-            return {
-                "success": False,
-                "error": str(e),
-                "synced": 0,
-                "created": 0,
-                "updated": 0,
-                "portals": []
-            }
-    
-    async def get_synced_portals(self) -> Dict[str, Any]:
-        """Retorna lista de portais sincronizados no banco"""
+            logger.error(f"Erro geral na sincronização de portais: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def get_synced_portals(self):
+        """Lista os portais que estão no banco local"""
         try:
-            portals = await self.db.portal.find_many()
-            
+            await self.ensure_connection()
+                
+            portals = await db.portal.find_many(order={"idFaceId": "asc"})
             return {
                 "success": True,
                 "count": len(portals),
                 "portals": [
-                    {
-                        "id": p.id,
-                        "idFaceId": p.idFaceId,
-                        "name": p.name,
-                        "createdAt": p.createdAt.isoformat() if p.createdAt else None
-                    }
+                    {"id": p.id, "idFaceId": p.idFaceId, "name": p.name} 
                     for p in portals
                 ]
             }
         except Exception as e:
-            logger.error(f"Erro ao buscar portais: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "count": 0,
-                "portals": []
-            }
+            return {"success": False, "error": str(e)}
 
-
-# Singleton instance
 portal_sync_service = PortalSyncService()

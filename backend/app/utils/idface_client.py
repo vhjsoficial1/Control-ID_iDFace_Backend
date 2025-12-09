@@ -10,8 +10,12 @@ from datetime import datetime, timedelta
 
 
 class IDFaceClient:
-    def __init__(self):
-        self.base_url = f"http://{settings.IDFACE_IP}"
+    def __init__(self, ip: str = None, login: str = None, password: str = None):
+        from app.config import settings
+        
+        self.base_url = f"http://{ip or settings.IDFACE_IP}"
+        self.login_user = login or settings.IDFACE_LOGIN
+        self.login_password = password or settings.IDFACE_PASSWORD
         self.session: Optional[str] = None
         self.session_expires: Optional[datetime] = None
         self.client = httpx.AsyncClient(timeout=30.0)
@@ -560,5 +564,16 @@ class IDFaceClient:
         )
 
 
-# Singleton instance
-idface_client = IDFaceClient()
+# Instância para Leitor 1
+idface_client = IDFaceClient(
+    ip=settings.IDFACE_IP,
+    login=settings.IDFACE_LOGIN,
+    password=settings.IDFACE_PASSWORD
+)
+
+# Instância para Leitor 2
+idface_client_2 = IDFaceClient(
+    ip=settings.IDFACE2_IP,
+    login=settings.IDFACE2_LOGIN,
+    password=settings.IDFACE2_PASSWORD
+)

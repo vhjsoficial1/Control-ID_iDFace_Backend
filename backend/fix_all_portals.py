@@ -50,7 +50,7 @@ async def fix_all_portal_associations():
         for portal in all_portals:
             if portal.id not in existing_portal_ids:
                 try:
-                    # Criar vínculo local
+                    # Criar vínculo local Portal-AccessRule
                     await db.portalaccessrule.create(
                         data={
                             "portalId": portal.id,
@@ -60,7 +60,7 @@ async def fix_all_portal_associations():
                     total_associations += 1
                     print(f"   ✅ Associado ao portal: {portal.name}")
                     
-                    # Sincronizar com iDFace
+                    # Sincronizar Portal-AccessRule com iDFace
                     if portal.idFaceId and access_rule.idFaceId:
                         try:
                             async with idface_client:
@@ -76,10 +76,64 @@ async def fix_all_portal_associations():
                                     }
                                 )
                             total_synced += 1
-                            print(f"   🔄 Sincronizado com iDFace")
+                            print(f"   🔄 Sincronizado Portal-AccessRule com iDFace")
                         except Exception as e:
-                            print(f"   ⚠️  Erro ao sincronizar com iDFace: {e}")
+                            print(f"   ⚠️  Erro ao sincronizar Portal-AccessRule: {e}")
                             total_errors += 1
+                    
+                    # ✅ ADICIONAL: Tentar vincular Portal aos Groups relacionados
+                    # Buscar grupos vinculados a esta AccessRule
+                    group_rules = await db.groupaccessrule.find_many(
+                        where={"accessRuleId": access_rule.id},
+                        include={"group": True}
+                    )
+                    
+                    for gar in group_rules:
+                        if gar.group and gar.group.idFaceId and portal.idFaceId:
+                            try:
+                                async with idface_client:
+                                    await idface_client.request(
+                                        "POST",
+                                        "create_objects.fcgi",
+                                        json={
+                                            "object": "portal_groups",
+                                            "values": [{
+                                                "portal_id": portal.idFaceId,
+                                                "group_id": gar.group.idFaceId
+                                            }]
+                                        }
+                                    )
+                                print(f"   🔗 Vinculado Portal ao Group '{gar.group.name}'")
+                            except Exception as e:
+                                # Vínculo direto pode não existir no iDFace
+                                print(f"   ℹ️  Vínculo Portal-Group: {e}")
+                    
+                    # ✅ ADICIONAL: Tentar vincular Portal aos TimeZones relacionados
+                    # Buscar time zones vinculados a esta AccessRule
+                    tz_rules = await db.accessruletimezone.find_many(
+                        where={"accessRuleId": access_rule.id},
+                        include={"timeZone": True}
+                    )
+                    
+                    for artz in tz_rules:
+                        if artz.timeZone and artz.timeZone.idFaceId and portal.idFaceId:
+                            try:
+                                async with idface_client:
+                                    await idface_client.request(
+                                        "POST",
+                                        "create_objects.fcgi",
+                                        json={
+                                            "object": "portal_time_zones",
+                                            "values": [{
+                                                "portal_id": portal.idFaceId,
+                                                "time_zone_id": artz.timeZone.idFaceId
+                                            }]
+                                        }
+                                    )
+                                print(f"   🕐 Vinculado Portal ao TimeZone '{artz.timeZone.name}'")
+                            except Exception as e:
+                                # Vínculo direto pode não existir no iDFace
+                                print(f"   ℹ️  Vínculo Portal-TimeZone: {e}")
                 
                 except Exception as e:
                     print(f"   ❌ Erro ao associar portal {portal.name}: {e}")

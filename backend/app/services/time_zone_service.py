@@ -136,7 +136,7 @@ class TimeZoneService:
             portals_associated = 0
             for portal in all_portals:
                 try:
-                    # Criar vínculo local
+                    # Criar vínculo local Portal-AccessRule
                     await db.portalaccessrule.create(
                         data={
                             "portalId": portal.id,
@@ -145,7 +145,7 @@ class TimeZoneService:
                     )
                     portals_associated += 1
                     
-                    # Sincronizar com iDFace
+                    # Sincronizar Portal-AccessRule no iDFace
                     if portal.idFaceId and new_access_rule.idFaceId:
                         try:
                             async with idface_client:
@@ -160,8 +160,30 @@ class TimeZoneService:
                                         }]
                                     }
                                 )
+                                print(f"✅ Portal '{portal.name}' → AccessRule (TimeZone '{name}')")
                         except Exception as e:
-                            print(f"Aviso: Erro ao sincronizar portal {portal.id}: {e}")
+                            print(f"Aviso: Erro ao sincronizar Portal-AccessRule: {e}")
+                    
+                    # ✅ ADICIONAL: Vincular Portal diretamente ao TimeZone no iDFace
+                    if portal.idFaceId and idface_id:
+                        try:
+                            async with idface_client:
+                                # Criar vínculo portal_time_zones no iDFace
+                                await idface_client.request(
+                                    "POST",
+                                    "create_objects.fcgi",
+                                    json={
+                                        "object": "portal_time_zones",
+                                        "values": [{
+                                            "portal_id": portal.idFaceId,
+                                            "time_zone_id": idface_id
+                                        }]
+                                    }
+                                )
+                                print(f"✅ Portal '{portal.name}' → TimeZone (direto)")
+                        except Exception as e:
+                            # Vínculo direto pode não existir, não é crítico
+                            print(f"Info: Vínculo direto Portal-TimeZone: {e}")
                 
                 except Exception as e:
                     print(f"Aviso: Erro ao associar portal {portal.id}: {e}")

@@ -1,12 +1,14 @@
 """
-Rotas completas para Access Rules com sincronização iDFace
+Rotas completas para Access Rules com sincronização iDFace (Fila Indiana / Sequencial)
 backend/app/routers/access_rules.py
 """
 from fastapi import APIRouter, HTTPException, Depends, status
 from app.database import get_db
-from app.utils.idface_client import idface_client
+# Importando ambos os clientes
+from app.utils.idface_client import idface_client, idface_client_2
 from typing import Optional, List
 from pydantic import BaseModel, Field
+import asyncio
 
 router = APIRouter()
 
@@ -55,13 +57,23 @@ class GroupResponse(BaseModel):
     class Config:
         from_attributes = True
 
+# ==================== Helpers ====================
+
+async def _safe_request(client, method, endpoint, **kwargs):
+    """Executa requisição sem travar o fluxo em caso de erro"""
+    try:
+        async with client:
+            return await client.request(method, endpoint, **kwargs)
+    except Exception as e:
+        print(f"⚠️ Erro silencioso no {client.base_url} ({endpoint}): {e}")
+        return None
 
 # ==================== CRUD Access Rules ====================
 
 @router.post("/", response_model=AccessRuleResponse, status_code=status.HTTP_201_CREATED)
 async def create_access_rule(rule: AccessRuleCreate, db = Depends(get_db)):
     """
-    Cria regra de acesso no banco local E no iDFace simultaneamente
+    Cria regra de acesso no banco local E nos leitores (Sequencialmente)
     """
     try:
         # 1. Criar no banco local primeiro
@@ -73,97 +85,66 @@ async def create_access_rule(rule: AccessRuleCreate, db = Depends(get_db)):
             }
         )
         
+        # Dados para envio
+        payload = {
+            "name": rule.name,
+            "type": rule.type,
+            "priority": rule.priority
+        }
+
+        # Variáveis para armazenar IDs retornados
+        id_leitor_1 = None
+        id_leitor_2 = None
+
+        # ---------------- LEITOR 1 ----------------
         try:
-            # 2. Sincronizar com iDFace
             async with idface_client:
-                # Criar regra no iDFace
-                idface_result = await idface_client.create_access_rule({
-                    "name": rule.name,
-                    "type": rule.type,
-                    "priority": rule.priority
-                })
-                
-                # Extrair ID do iDFace
-                idface_ids = idface_result.get("ids", [])
-                if not idface_ids:
-                    raise ValueError("iDFace não retornou IDs da regra criada")
-                
-                idface_rule_id = idface_ids[0]
-                
-                # 3. Atualizar banco local com idFaceId
-                new_rule = await db.accessrule.update(
-                    where={"id": new_rule.id},
-                    data={"idFaceId": idface_rule_id}
-                )
-                
-                # 4. Vincular Time Zones se fornecidos
-                if rule.timeZoneIds:
-                    for tz_id in rule.timeZoneIds:
-                        # Verificar se time zone existe e está sincronizado
-                        tz = await db.timezone.find_unique(where={"id": tz_id})
-                        if not tz:
-                            raise ValueError(f"Time zone {tz_id} não encontrado")
-                        
-                        if not tz.idFaceId:
-                            raise ValueError(f"Time zone '{tz.name}' não está sincronizado com iDFace")
-                        
-                        # Criar vínculo no banco local
-                        await db.accessruletimezone.create(
-                            data={
-                                "accessRuleId": new_rule.id,
-                                "timeZoneId": tz_id
-                            }
-                        )
-                        
-                        # Criar vínculo no iDFace
-                        await idface_client.request(
-                            "POST",
-                            "create_objects.fcgi",
-                            json={
-                                "object": "access_rule_time_zones",
-                                "values": [{
-                                    "access_rule_id": idface_rule_id,
-                                    "time_zone_id": tz.idFaceId
-                                }]
-                            }
-                        )
-                
-                # 5. Vincular Portais se fornecidos
-                if rule.portalIds:
-                    for portal_id in rule.portalIds:
-                        portal = await db.portal.find_unique(where={"id": portal_id})
-                        if not portal:
-                            raise ValueError(f"Portal {portal_id} não encontrado")
-                        
-                        # Criar vínculo no banco local
-                        await db.portalaccessrule.create(
-                            data={
-                                "portalId": portal_id,
-                                "accessRuleId": new_rule.id
-                            }
-                        )
-                        
-                        # Vincular no iDFace (se portal tiver idFaceId)
-                        if portal.idFaceId:
-                            await idface_client.request(
-                                "POST",
-                                "create_objects.fcgi",
-                                json={
-                                    "object": "portal_access_rules",
-                                    "values": [{
-                                        "portal_id": portal.idFaceId,
-                                        "access_rule_id": idface_rule_id
-                                    }]
-                                }
-                            )
+                # Criar regra
+                res1 = await idface_client.create_access_rule(payload)
+                if res1.get("ids"):
+                    id_leitor_1 = res1["ids"][0]
+                    
+                    # Sincronizar vínculos (TimeZones e Portais) no Leitor 1
+                    await _sync_rule_relationships(idface_client, id_leitor_1, rule, db)
+                    print(f"✅ Regra criada no Leitor 1 (ID: {id_leitor_1})")
+        except Exception as e:
+            print(f"❌ Erro Leitor 1: {e}")
+
+        # ---------------- LEITOR 2 ----------------
+        try:
+            async with idface_client_2:
+                # Criar regra
+                res2 = await idface_client_2.create_access_rule(payload)
+                if res2.get("ids"):
+                    id_leitor_2 = res2["ids"][0]
+                    
+                    # Sincronizar vínculos (TimeZones e Portais) no Leitor 2
+                    await _sync_rule_relationships(idface_client_2, id_leitor_2, rule, db)
+                    print(f"✅ Regra criada no Leitor 2 (ID: {id_leitor_2})")
+        except Exception as e:
+            print(f"❌ Erro Leitor 2: {e}")
+
+        # 3. Atualizar banco local com idFaceId (Prioridade Leitor 1)
+        final_id = id_leitor_1 or id_leitor_2
         
-        except Exception as sync_error:
-            # Se falhar a sincronização, deletar do banco local
-            await db.accessrule.delete(where={"id": new_rule.id})
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Erro ao sincronizar com iDFace: {str(sync_error)}"
+        if final_id:
+            new_rule = await db.accessrule.update(
+                where={"id": new_rule.id},
+                data={"idFaceId": final_id}
             )
+            
+            # Criar vínculos no banco LOCAL
+            if rule.timeZoneIds:
+                for tz_id in rule.timeZoneIds:
+                     await db.accessruletimezone.create(data={"accessRuleId": new_rule.id, "timeZoneId": tz_id})
+            
+            if rule.portalIds:
+                for portal_id in rule.portalIds:
+                    await db.portalaccessrule.create(data={"portalId": portal_id, "accessRuleId": new_rule.id})
+        else:
+            # Se falhou nos dois, deleta local
+            await db.accessrule.delete(where={"id": new_rule.id})
+            raise HTTPException(status_code=502, detail="Falha ao criar regra nos leitores")
         
         # 6. Recarregar com relacionamentos
         result = await db.accessrule.find_unique(
@@ -176,11 +157,35 @@ async def create_access_rule(rule: AccessRuleCreate, db = Depends(get_db)):
         
         return result
         
+    except HTTPException as he:
+        raise he
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Erro ao criar regra: {str(e)}"
         )
+
+async def _sync_rule_relationships(client, rule_id_device, rule_data, db):
+    """Auxiliar para vincular TimeZones e Portais dentro do contexto do cliente"""
+    # Time Zones
+    if rule_data.timeZoneIds:
+        for tz_id in rule_data.timeZoneIds:
+            tz = await db.timezone.find_unique(where={"id": tz_id})
+            if tz and tz.idFaceId:
+                await client.request("POST", "create_objects.fcgi", json={
+                    "object": "access_rule_time_zones",
+                    "values": [{"access_rule_id": rule_id_device, "time_zone_id": tz.idFaceId}]
+                })
+
+    # Portais
+    if rule_data.portalIds:
+        for portal_id in rule_data.portalIds:
+            portal = await db.portal.find_unique(where={"id": portal_id})
+            if portal and portal.idFaceId:
+                await client.request("POST", "create_objects.fcgi", json={
+                    "object": "portal_access_rules",
+                    "values": [{"portal_id": portal.idFaceId, "access_rule_id": rule_id_device}]
+                })
 
 
 @router.get("/", response_model=List[AccessRuleResponse])
@@ -190,9 +195,6 @@ async def list_access_rules(
     include_details: bool = True,
     db = Depends(get_db)
 ):
-    """
-    Lista todas as regras de acesso com detalhes, incluindo usuários de grupos.
-    """
     include_config = {}
     if include_details:
         include_config = {
@@ -221,19 +223,15 @@ async def list_access_rules(
     for rule in rules_from_db:
         all_users = {}
         if include_details:
-            # Adiciona usuários diretamente ligados à regra
             if hasattr(rule, 'userAccessRules') and rule.userAccessRules:
                 for uar in rule.userAccessRules:
-                    if uar.user:
-                        all_users[uar.user.id] = uar.user
+                    if uar.user: all_users[uar.user.id] = uar.user
             
-            # Adiciona usuários de grupos ligados à regra
             if hasattr(rule, 'groupAccessRules') and rule.groupAccessRules:
                 for gar in rule.groupAccessRules:
                     if gar.group and hasattr(gar.group, 'userGroups') and gar.group.userGroups:
                         for ug in gar.group.userGroups:
-                            if ug.user:
-                                all_users[ug.user.id] = ug.user
+                            if ug.user: all_users[ug.user.id] = ug.user
 
         rule_dict = {
             "id": rule.id,
@@ -252,9 +250,6 @@ async def list_access_rules(
 
 @router.get("/{rule_id}", response_model=AccessRuleResponse)
 async def get_access_rule(rule_id: int, db = Depends(get_db)):
-    """
-    Busca regra de acesso por ID com todos os relacionamentos, incluindo usuários de grupos.
-    """
     rule = await db.accessrule.find_unique(
         where={"id": rule_id},
         include={
@@ -274,26 +269,18 @@ async def get_access_rule(rule_id: int, db = Depends(get_db)):
     )
     
     if not rule:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Regra {rule_id} não encontrada"
-        )
+        raise HTTPException(status_code=404, detail=f"Regra {rule_id} não encontrada")
     
     all_users = {}
-
-    # Adiciona usuários diretamente ligados à regra
     if hasattr(rule, 'userAccessRules') and rule.userAccessRules:
         for uar in rule.userAccessRules:
-            if uar.user:
-                all_users[uar.user.id] = uar.user
+            if uar.user: all_users[uar.user.id] = uar.user
 
-    # Adiciona usuários de grupos ligados à regra
     if hasattr(rule, 'groupAccessRules') and rule.groupAccessRules:
         for gar in rule.groupAccessRules:
             if gar.group and hasattr(gar.group, 'userGroups'):
                 for ug in gar.group.userGroups:
-                    if ug.user:
-                        all_users[ug.user.id] = ug.user
+                    if ug.user: all_users[ug.user.id] = ug.user
 
     rule_dict = {
         "id": rule.id,
@@ -315,75 +302,51 @@ async def update_access_rule(
     rule_data: AccessRuleUpdate, 
     db = Depends(get_db)
 ):
-    """
-    Atualiza regra de acesso (local e iDFace)
-    """
     existing = await db.accessrule.find_unique(where={"id": rule_id})
     if not existing:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Regra {rule_id} não encontrada"
-        )
+        raise HTTPException(status_code=404, detail="Regra não encontrada")
     
     update_data = rule_data.model_dump(exclude_unset=True)
     
-    # Atualizar localmente
     updated_rule = await db.accessrule.update(
         where={"id": rule_id},
         data=update_data
     )
     
-    # Se estiver sincronizado, atualizar no iDFace
     if existing.idFaceId and update_data:
-        try:
-            async with idface_client:
-                await idface_client.request(
-                    "POST",
-                    "modify_objects.fcgi",
-                    json={
-                        "object": "access_rules",
-                        "values": update_data,
-                        "where": {
-                            "access_rules": {"id": existing.idFaceId}
-                        }
-                    }
-                )
-        except Exception as e:
-            print(f"Aviso: Erro ao atualizar no iDFace: {e}")
+        req_data = {
+            "object": "access_rules",
+            "values": update_data,
+            "where": {"access_rules": {"id": existing.idFaceId}}
+        }
+        
+        # Leitor 1
+        await _safe_request(idface_client, "POST", "modify_objects.fcgi", json=req_data)
+        
+        # Leitor 2
+        await _safe_request(idface_client_2, "POST", "modify_objects.fcgi", json=req_data)
     
     return updated_rule
 
 
 @router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_access_rule(rule_id: int, db = Depends(get_db)):
-    """
-    Deleta regra de acesso (local e iDFace)
-    """
     existing = await db.accessrule.find_unique(where={"id": rule_id})
     if not existing:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Regra {rule_id} não encontrada"
-        )
+        raise HTTPException(status_code=404, detail="Regra não encontrada")
     
-    # Deletar do iDFace primeiro (se sincronizado)
     if existing.idFaceId:
-        try:
-            async with idface_client:
-                await idface_client.request(
-                    "POST",
-                    "destroy_objects.fcgi",
-                    json={
-                        "object": "access_rules",
-                        "where": {
-                            "access_rules": {"id": existing.idFaceId}
-                        }
-                    }
-                )
-        except Exception as e:
-            print(f"Aviso: Erro ao deletar do iDFace: {e}")
+        req_data = {
+            "object": "access_rules",
+            "where": {"access_rules": {"id": existing.idFaceId}}
+        }
+        
+        # Leitor 1
+        await _safe_request(idface_client, "POST", "destroy_objects.fcgi", json=req_data)
+        
+        # Leitor 2
+        await _safe_request(idface_client_2, "POST", "destroy_objects.fcgi", json=req_data)
     
-    # Deletar localmente (cascade automático)
     await db.accessrule.delete(where={"id": rule_id})
 
 
@@ -395,69 +358,35 @@ async def link_portal_to_rule(
     portal_id: int,
     db = Depends(get_db)
 ):
-    """
-    Vincula portal a regra de acesso
-    """
-    # Verificar se regra existe
     rule = await db.accessrule.find_unique(where={"id": rule_id})
-    if not rule:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Regra {rule_id} não encontrada"
-        )
-    
-    # Verificar se portal existe
     portal = await db.portal.find_unique(where={"id": portal_id})
-    if not portal:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Portal {portal_id} não encontrado"
-        )
     
-    # Verificar duplicata
+    if not rule or not portal:
+        raise HTTPException(status_code=404, detail="Regra ou Portal não encontrado")
+    
     existing = await db.portalaccessrule.find_first(
-        where={
-            "portalId": portal_id,
-            "accessRuleId": rule_id
-        }
+        where={"portalId": portal_id, "accessRuleId": rule_id}
     )
-    
     if existing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Portal já vinculado a esta regra"
-        )
+        raise HTTPException(status_code=400, detail="Vínculo já existe")
     
-    # Criar vínculo local
-    link = await db.portalaccessrule.create(
-        data={
-            "portalId": portal_id,
-            "accessRuleId": rule_id
-        }
+    await db.portalaccessrule.create(
+        data={"portalId": portal_id, "accessRuleId": rule_id}
     )
     
-    # Sincronizar com iDFace (se ambos estiverem sincronizados)
     if rule.idFaceId and portal.idFaceId:
-        try:
-            async with idface_client:
-                await idface_client.request(
-                    "POST",
-                    "create_objects.fcgi",
-                    json={
-                        "object": "portal_access_rules",
-                        "values": [{
-                            "portal_id": portal.idFaceId,
-                            "access_rule_id": rule.idFaceId
-                        }]
-                    }
-                )
-        except Exception as e:
-            print(f"Aviso: Erro ao sincronizar vínculo com iDFace: {e}")
+        req_data = {
+            "object": "portal_access_rules",
+            "values": [{"portal_id": portal.idFaceId, "access_rule_id": rule.idFaceId}]
+        }
+        
+        # Leitor 1
+        await _safe_request(idface_client, "POST", "create_objects.fcgi", json=req_data)
+        
+        # Leitor 2
+        await _safe_request(idface_client_2, "POST", "create_objects.fcgi", json=req_data)
     
-    return {
-        "success": True,
-        "message": f"Portal '{portal.name}' vinculado à regra '{rule.name}'"
-    }
+    return {"success": True, "message": "Portal vinculado com sucesso"}
 
 
 @router.delete("/{rule_id}/portals/{portal_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -466,39 +395,23 @@ async def unlink_portal_from_rule(
     portal_id: int,
     db = Depends(get_db)
 ):
-    """
-    Remove vínculo entre portal e regra
-    """
     link = await db.portalaccessrule.find_first(
-        where={
-            "portalId": portal_id,
-            "accessRuleId": rule_id
-        }
+        where={"portalId": portal_id, "accessRuleId": rule_id}
     )
     
     if not link:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Vínculo não encontrado"
-        )
+        raise HTTPException(status_code=404, detail="Vínculo não encontrado")
     
     await db.portalaccessrule.delete(where={"id": link.id})
 
 
 @router.get("/{rule_id}/portals")
 async def list_portals_in_rule(rule_id: int, db = Depends(get_db)):
-    """
-    Lista portais vinculados a uma regra
-    """
     links = await db.portalaccessrule.find_many(
         where={"accessRuleId": rule_id},
         include={"portal": True}
     )
-    
-    return {
-        "ruleId": rule_id,
-        "portals": [link.portal for link in links]
-    }
+    return {"ruleId": rule_id, "portals": [link.portal for link in links]}
 
 
 # ==================== Group Management ====================
@@ -506,267 +419,200 @@ async def list_portals_in_rule(rule_id: int, db = Depends(get_db)):
 @router.post("/groups/", response_model=GroupResponse, status_code=status.HTTP_201_CREATED)
 async def create_group(group: GroupCreate, db = Depends(get_db)):
     """
-    Cria grupo de usuários e ASSOCIA AUTOMATICAMENTE aos portais existentes
+    Cria grupo e associa a regras e portais. 
+    Lógica de Fila Indiana aplicada: 
+    Executa fluxo completo no L1, salva DB, executa fluxo completo no L2.
     """
+    # 1. Criar grupo no banco local
+    new_group = await db.group.create(data={"name": group.name})
+    
+    # Prepara dados para a função de fluxo
+    access_rule_name = f"Access Rule for Group: {new_group.name}"
+    
+    # Variáveis para armazenar IDs
+    l1_group_id = None
+    l2_group_id = None
+    
+    # ---------------- LEITOR 1 ----------------
     try:
-        # 1. Criar grupo no banco local
-        new_group = await db.group.create(
-            data={"name": group.name}
-        )
-        
-        # 2. Sincronizar grupo com iDFace
-        try:
-            async with idface_client:
-                result = await idface_client.request(
-                    "POST",
-                    "create_objects.fcgi",
-                    json={
-                        "object": "groups",
-                        "values": [{"name": group.name}]
-                    }
-                )
+        async with idface_client:
+            # A) Criar Grupo
+            res_g = await idface_client.request("POST", "create_objects.fcgi", json={
+                "object": "groups", "values": [{"name": group.name}]
+            })
+            if res_g.get("ids"):
+                l1_group_id = res_g["ids"][0]
                 
-                idface_ids = result.get("ids", [])
-                if idface_ids:
-                    new_group = await db.group.update(
-                        where={"id": new_group.id},
-                        data={"idFaceId": idface_ids[0]}
-                    )
-        except Exception as e:
-            print(f"Aviso: Erro ao sincronizar grupo com iDFace: {e}")
-        
-        # 3. Criar AccessRule para o grupo
-        access_rule_name = f"Access Rule for Group: {new_group.name}"
-        new_access_rule = await db.accessrule.create(
-            data={
-                "name": access_rule_name,
-                "type": 1,
-                "priority": 10
-            }
-        )
-        
-        # 4. Sincronizar AccessRule com iDFace
-        try:
-            async with idface_client:
-                idface_ar_result = await idface_client.create_access_rule({
-                    "name": access_rule_name,
-                    "type": 1,
-                    "priority": 10
+                # B) Criar Regra
+                res_ar = await idface_client.create_access_rule({
+                    "name": access_rule_name, "type": 1, "priority": 10
                 })
-                idface_ar_ids = idface_ar_result.get("ids", [])
-                if idface_ar_ids:
-                    new_access_rule = await db.accessrule.update(
-                        where={"id": new_access_rule.id},
-                        data={"idFaceId": idface_ar_ids[0]}
-                    )
-        except Exception as e:
-            print(f"Aviso: Erro ao sincronizar AccessRule com iDFace: {e}")
-        
-        # 5. Vincular o grupo à AccessRule
-        await db.groupaccessrule.create(
-            data={
-                "groupId": new_group.id,
-                "accessRuleId": new_access_rule.id
-            }
+                l1_ar_id = res_ar["ids"][0]
+                
+                # C) Vincular Grupo-Regra
+                await idface_client.request("POST", "create_objects.fcgi", json={
+                    "object": "group_access_rules",
+                    "values": [{"group_id": l1_group_id, "access_rule_id": l1_ar_id}]
+                })
+                
+                # D) Vincular Portais (Todos)
+                all_portals = await db.portal.find_many()
+                for portal in all_portals:
+                    if portal.idFaceId:
+                        # Portal -> Regra
+                        await idface_client.request("POST", "create_objects.fcgi", json={
+                            "object": "portal_access_rules",
+                            "values": [{"portal_id": portal.idFaceId, "access_rule_id": l1_ar_id}]
+                        })
+                        # Portal -> Grupo (Opcional, mas feito no original)
+                        await idface_client.request("POST", "create_objects.fcgi", json={
+                            "object": "portal_groups",
+                            "values": [{"portal_id": portal.idFaceId, "group_id": l1_group_id}]
+                        })
+                
+                print(f"✅ Fluxo de grupo completo no Leitor 1 (ID: {l1_group_id})")
+
+    except Exception as e:
+        print(f"❌ Erro Leitor 1 ao criar grupo: {e}")
+
+    # ---------------- LEITOR 2 ----------------
+    try:
+        async with idface_client_2:
+            # A) Criar Grupo
+            res_g = await idface_client_2.request("POST", "create_objects.fcgi", json={
+                "object": "groups", "values": [{"name": group.name}]
+            })
+            if res_g.get("ids"):
+                l2_group_id = res_g["ids"][0]
+                
+                # B) Criar Regra
+                res_ar = await idface_client_2.create_access_rule({
+                    "name": access_rule_name, "type": 1, "priority": 10
+                })
+                l2_ar_id = res_ar["ids"][0]
+                
+                # C) Vincular Grupo-Regra
+                await idface_client_2.request("POST", "create_objects.fcgi", json={
+                    "object": "group_access_rules",
+                    "values": [{"group_id": l2_group_id, "access_rule_id": l2_ar_id}]
+                })
+                
+                # D) Vincular Portais (Todos)
+                all_portals = await db.portal.find_many()
+                for portal in all_portals:
+                    if portal.idFaceId:
+                         # Portal -> Regra
+                        await idface_client_2.request("POST", "create_objects.fcgi", json={
+                            "object": "portal_access_rules",
+                            "values": [{"portal_id": portal.idFaceId, "access_rule_id": l2_ar_id}]
+                        })
+                        # Portal -> Grupo
+                        await idface_client_2.request("POST", "create_objects.fcgi", json={
+                            "object": "portal_groups",
+                            "values": [{"portal_id": portal.idFaceId, "group_id": l2_group_id}]
+                        })
+                
+                print(f"✅ Fluxo de grupo completo no Leitor 2 (ID: {l2_group_id})")
+
+    except Exception as e:
+        print(f"❌ Erro Leitor 2 ao criar grupo: {e}")
+
+    # 3. Atualizar Local e Criar Relacionamentos Locais
+    final_group_id = l1_group_id or l2_group_id
+    
+    if final_group_id:
+        # Atualiza Grupo
+        new_group = await db.group.update(
+            where={"id": new_group.id},
+            data={"idFaceId": final_group_id}
         )
         
-        # Sincronizar vínculo Group-AccessRule no iDFace
-        if new_group.idFaceId and new_access_rule.idFaceId:
-            try:
-                async with idface_client:
-                    await idface_client.request(
-                        "POST",
-                        "create_objects.fcgi",
-                        json={
-                            "object": "group_access_rules",
-                            "values": [{
-                                "group_id": new_group.idFaceId,
-                                "access_rule_id": new_access_rule.idFaceId
-                            }]
-                        }
-                    )
-            except Exception as e:
-                print(f"Aviso: Erro ao sincronizar Group-AccessRule: {e}")
+        # Cria e atualiza Regra Local
+        new_access_rule = await db.accessrule.create(
+            data={"name": access_rule_name, "type": 1, "priority": 10, "idFaceId": l1_ar_id if l1_group_id else l2_ar_id}
+        )
         
-        # ✅ 6. NOVO: ASSOCIAR AUTOMATICAMENTE A TODOS OS PORTAIS EXISTENTES
+        # Vínculo Grupo-Regra Local
+        await db.groupaccessrule.create(
+            data={"groupId": new_group.id, "accessRuleId": new_access_rule.id}
+        )
+        
+        # Vínculo Portal-Regra Local
         all_portals = await db.portal.find_many()
-        
-        portals_associated = 0
         for portal in all_portals:
-            try:
-                # Criar vínculo local Portal-AccessRule
-                await db.portalaccessrule.create(
-                    data={
-                        "portalId": portal.id,
-                        "accessRuleId": new_access_rule.id
-                    }
-                )
-                portals_associated += 1
-                
-                # Sincronizar vínculo no iDFace
-                if portal.idFaceId and new_access_rule.idFaceId:
-                    try:
-                        async with idface_client:
-                            await idface_client.request(
-                                "POST",
-                                "create_objects.fcgi",
-                                json={
-                                    "object": "portal_access_rules",
-                                    "values": [{
-                                        "portal_id": portal.idFaceId,
-                                        "access_rule_id": new_access_rule.idFaceId
-                                    }]
-                                }
-                            )
-                    except Exception as e:
-                        print(f"Aviso: Erro ao sincronizar portal {portal.id} com iDFace: {e}")
-            
-            except Exception as e:
-                print(f"Aviso: Erro ao associar portal {portal.id}: {e}")
-        
-        print(f"✅ Grupo criado e associado a {portals_associated} portal(is)")
-        
-        # 7. Associar usuários se fornecidos
+            await db.portalaccessrule.create(
+                 data={"portalId": portal.id, "accessRuleId": new_access_rule.id}
+            )
+
+        # Adicionar usuários
         if group.userIds:
             for user_id in group.userIds:
                 user = await db.user.find_unique(where={"id": user_id})
-                if not user:
-                    continue
-                
-                await db.usergroup.create(
-                    data={"userId": user.id, "groupId": new_group.id}
-                )
-                
-                if new_group.idFaceId and user.idFaceId:
-                    try:
-                        async with idface_client:
-                            await idface_client.request(
-                                "POST",
-                                "create_objects.fcgi",
-                                json={
-                                    "object": "user_groups",
-                                    "values": [{
-                                        "user_id": user.idFaceId,
-                                        "group_id": new_group.idFaceId
-                                    }]
-                                }
-                            )
-                    except Exception as e:
-                        print(f"Aviso: Erro ao sincronizar usuário {user.id}: {e}")
-        
-        # 8. Vincular TimeZone se fornecido
+                if user:
+                    await db.usergroup.create(data={"userId": user.id, "groupId": new_group.id})
+                    if user.idFaceId:
+                        req_data = {
+                            "object": "user_groups",
+                            "values": [{"user_id": user.idFaceId, "group_id": final_group_id}]
+                        }
+                        await _safe_request(idface_client, "POST", "create_objects.fcgi", json=req_data)
+                        await _safe_request(idface_client_2, "POST", "create_objects.fcgi", json=req_data)
+                        
+        # Adicionar TimeZone
         if group.timeZoneId:
-            time_zone = await db.timezone.find_unique(where={"id": group.timeZoneId})
-            if not time_zone:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Time Zone {group.timeZoneId} não encontrado."
-                )
-            
-            # Vincular TimeZone à AccessRule
-            await db.accessruletimezone.create(
-                data={
-                    "accessRuleId": new_access_rule.id,
-                    "timeZoneId": time_zone.id
-                }
-            )
-            
-            # Sincronizar vínculo no iDFace
-            if new_access_rule.idFaceId and time_zone.idFaceId:
-                try:
-                    async with idface_client:
-                        await idface_client.request(
-                            "POST",
-                            "create_objects.fcgi",
-                            json={
-                                "object": "access_rule_time_zones",
-                                "values": [{
-                                    "access_rule_id": new_access_rule.idFaceId,
-                                    "time_zone_id": time_zone.idFaceId
-                                }]
-                            }
-                        )
-                except Exception as e:
-                    print(f"Aviso: Erro ao sincronizar TimeZone-AccessRule: {e}")
-        
+            tz = await db.timezone.find_unique(where={"id": group.timeZoneId})
+            if tz:
+                await db.accessruletimezone.create(data={"accessRuleId": new_access_rule.id, "timeZoneId": tz.id})
+                if tz.idFaceId:
+                    req_data = {
+                        "object": "access_rule_time_zones",
+                        "values": [{"access_rule_id": new_access_rule.idFaceId, "time_zone_id": tz.idFaceId}]
+                    }
+                    await _safe_request(idface_client, "POST", "create_objects.fcgi", json=req_data)
+                    await _safe_request(idface_client_2, "POST", "create_objects.fcgi", json=req_data)
+
         return new_group
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Erro ao criar grupo: {str(e)}"
-        )
+    else:
+        await db.group.delete(where={"id": new_group.id})
+        raise HTTPException(status_code=500, detail="Falha ao criar grupo nos leitores")
 
 @router.get("/groups/", response_model=List[GroupResponse])
 async def list_groups(db = Depends(get_db)):
-    """
-    Lista todos os grupos
-    """
-    groups = await db.group.find_many(order={"name": "asc"})
-    return groups
+    return await db.group.find_many(order={"name": "asc"})
 
 
 @router.post("/{rule_id}/groups/{group_id}")
-async def link_group_to_rule(
-    rule_id: int,
-    group_id: int,
-    db = Depends(get_db)
-):
-    """
-    Vincula grupo a regra de acesso
-    """
-    # Verificações
+async def link_group_to_rule(rule_id: int, group_id: int, db = Depends(get_db)):
     rule = await db.accessrule.find_unique(where={"id": rule_id})
-    if not rule:
-        raise HTTPException(status_code=404, detail="Regra não encontrada")
-    
     group = await db.group.find_unique(where={"id": group_id})
-    if not group:
-        raise HTTPException(status_code=404, detail="Grupo não encontrado")
     
-    # Verificar duplicata
-    existing = await db.groupaccessrule.find_first(
-        where={"groupId": group_id, "accessRuleId": rule_id}
-    )
+    if not rule or not group:
+        raise HTTPException(status_code=404, detail="Regra ou Grupo não encontrado")
     
+    existing = await db.groupaccessrule.find_first(where={"groupId": group_id, "accessRuleId": rule_id})
     if existing:
-        raise HTTPException(status_code=400, detail="Grupo já vinculado a esta regra")
+        raise HTTPException(status_code=400, detail="Vínculo já existe")
     
-    # Criar vínculo
-    await db.groupaccessrule.create(
-        data={"groupId": group_id, "accessRuleId": rule_id}
-    )
+    await db.groupaccessrule.create(data={"groupId": group_id, "accessRuleId": rule_id})
     
-    # Sincronizar com iDFace
     if rule.idFaceId and group.idFaceId:
-        try:
-            async with idface_client:
-                await idface_client.request(
-                    "POST",
-                    "create_objects.fcgi",
-                    json={
-                        "object": "group_access_rules",
-                        "values": [{
-                            "group_id": group.idFaceId,
-                            "access_rule_id": rule.idFaceId
-                        }]
-                    }
-                )
-        except Exception as e:
-            print(f"Aviso: {e}")
+        req_data = {
+            "object": "group_access_rules",
+            "values": [{"group_id": group.idFaceId, "access_rule_id": rule.idFaceId}]
+        }
+        # L1
+        await _safe_request(idface_client, "POST", "create_objects.fcgi", json=req_data)
+        # L2
+        await _safe_request(idface_client_2, "POST", "create_objects.fcgi", json=req_data)
     
-    return {"success": True, "message": f"Grupo '{group.name}' vinculado à regra '{rule.name}'"}
+    return {"success": True, "message": "Grupo vinculado com sucesso"}
 
 
 @router.delete("/{rule_id}/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def unlink_group_from_rule(rule_id: int, group_id: int, db = Depends(get_db)):
-    """
-    Remove vínculo entre grupo e regra
-    """
     link = await db.groupaccessrule.find_first(
         where={"groupId": group_id, "accessRuleId": rule_id}
     )
-    
     if not link:
         raise HTTPException(status_code=404, detail="Vínculo não encontrado")
     
@@ -777,113 +623,68 @@ async def unlink_group_from_rule(rule_id: int, group_id: int, db = Depends(get_d
 
 @router.post("/groups/{group_id}/users/{user_id}")
 async def add_user_to_group(group_id: int, user_id: int, db = Depends(get_db)):
-    """
-    Adiciona usuário a um grupo
-    """
-    # Verificações
     group = await db.group.find_unique(where={"id": group_id})
-    if not group:
-        raise HTTPException(status_code=404, detail="Grupo não encontrado")
-    
     user = await db.user.find_unique(where={"id": user_id})
-    if not user:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado")
     
-    # Verificar duplicata
-    existing = await db.usergroup.find_first(
-        where={"userId": user_id, "groupId": group_id}
-    )
+    if not group or not user:
+        raise HTTPException(status_code=404, detail="Grupo ou Usuário não encontrado")
     
+    existing = await db.usergroup.find_first(where={"userId": user_id, "groupId": group_id})
     if existing:
-        raise HTTPException(status_code=400, detail="Usuário já pertence a este grupo")
+        raise HTTPException(status_code=400, detail="Usuário já pertence ao grupo")
     
-    # Criar vínculo
-    await db.usergroup.create(
-        data={"userId": user_id, "groupId": group_id}
-    )
+    await db.usergroup.create(data={"userId": user_id, "groupId": group_id})
 
-    # Sincronizar com iDFace
     if group.idFaceId and user.idFaceId:
-        try:
-            async with idface_client:
-                await idface_client.request(
-                    "POST",
-                    "create_objects.fcgi",
-                    json={
-                        "object": "user_groups",
-                        "values": [{
-                            "user_id": user.idFaceId,
-                            "group_id": group.idFaceId
-                        }]
-                    }
-                )
-        except Exception as e:
-            print(f"Aviso: Erro ao sincronizar vínculo de usuário com grupo no iDFace: {e}")
+        req_data = {
+            "object": "user_groups",
+            "values": [{"user_id": user.idFaceId, "group_id": group.idFaceId}]
+        }
+        # L1
+        await _safe_request(idface_client, "POST", "create_objects.fcgi", json=req_data)
+        # L2
+        await _safe_request(idface_client_2, "POST", "create_objects.fcgi", json=req_data)
     
-    return {"success": True, "message": f"Usuário '{user.name}' adicionado ao grupo '{group.name}'"}
+    return {"success": True, "message": "Usuário adicionado ao grupo"}
 
 
 @router.delete("/groups/{group_id}/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_user_from_group(group_id: int, user_id: int, db = Depends(get_db)):
-    """
-    Remove usuário de um grupo
-    """
     link = await db.usergroup.find_first(
         where={"userId": user_id, "groupId": group_id},
         include={"user": True, "group": True}
     )
     
     if not link:
-        raise HTTPException(status_code=404, detail="Usuário não pertence a este grupo")
+        raise HTTPException(status_code=404, detail="Vínculo não encontrado")
 
-    # Deletar do iDFace primeiro
-    if link.group and link.group.idFaceId and link.user and link.user.idFaceId:
-        try:
-            async with idface_client:
-                await idface_client.request(
-                    "POST",
-                    "destroy_objects.fcgi",
-                    json={
-                        "object": "user_groups",
-                        "where": {
-                            "user_groups": {
-                                "user_id": link.user.idFaceId,
-                                "group_id": link.group.idFaceId
-                            }
-                        }
-                    }
-                )
-        except Exception as e:
-            # Log o erro mas não impede a deleção local
-            print(f"Aviso: Erro ao remover vínculo de usuário do grupo no iDFace: {e}")
+    if link.group.idFaceId and link.user.idFaceId:
+        req_data = {
+            "object": "user_groups",
+            "where": {"user_groups": {"user_id": link.user.idFaceId, "group_id": link.group.idFaceId}}
+        }
+        # L1
+        await _safe_request(idface_client, "POST", "destroy_objects.fcgi", json=req_data)
+        # L2
+        await _safe_request(idface_client_2, "POST", "destroy_objects.fcgi", json=req_data)
     
-    # Deletar do banco local
     await db.usergroup.delete(where={"id": link.id})
 
 
 @router.get("/groups/{group_id}/users")
 async def list_users_in_group(group_id: int, db = Depends(get_db)):
-    """
-    Lista usuários de um grupo
-    """
     links = await db.usergroup.find_many(
         where={"groupId": group_id},
         include={"user": True}
     )
-    
-    return {
-        "groupId": group_id,
-        "users": [link.user for link in links]
-    }
+    return {"groupId": group_id, "users": [link.user for link in links]}
 
 
 # ==================== Sync Operations ====================
 
 @router.post("/{rule_id}/sync-to-idface")
 async def sync_rule_to_idface(rule_id: int, db = Depends(get_db)):
-    """
-    Força sincronização completa de uma regra com o iDFace
-    """
+    """Força sincronização completa em ambos os leitores"""
     rule = await db.accessrule.find_unique(
         where={"id": rule_id},
         include={
@@ -895,365 +696,85 @@ async def sync_rule_to_idface(rule_id: int, db = Depends(get_db)):
     if not rule:
         raise HTTPException(status_code=404, detail="Regra não encontrada")
     
+    rule_payload = {
+        "name": rule.name,
+        "type": rule.type,
+        "priority": rule.priority
+    }
+
+    # Leitor 1
     try:
         async with idface_client:
-            # Se não tem idFaceId, criar
-            if not rule.idFaceId:
-                result = await idface_client.create_access_rule({
-                    "name": rule.name,
-                    "type": rule.type,
-                    "priority": rule.priority
-                })
-                
-                idface_ids = result.get("ids", [])
-                if not idface_ids:
-                    raise ValueError("iDFace não retornou IDs")
-                
-                idface_rule_id = idface_ids[0]
-                
-                await db.accessrule.update(
-                    where={"id": rule_id},
-                    data={"idFaceId": idface_rule_id}
-                )
-            else:
-                idface_rule_id = rule.idFaceId
-            
-            # Sincronizar time zones
-            synced_zones = 0
-            for art in rule.timeZones:
-                if art.timeZone.idFaceId:
-                    try:
-                        await idface_client.request(
-                            "POST",
-                            "create_objects.fcgi",
-                            json={
-                                "object": "access_rule_time_zones",
-                                "values": [{
-                                    "access_rule_id": idface_rule_id,
-                                    "time_zone_id": art.timeZone.idFaceId
-                                }]
-                            }
-                        )
-                        synced_zones += 1
-                    except Exception as e:
-                        print(f"Erro ao vincular time zone: {e}")
-            
-            # Sincronizar portais
-            synced_portals = 0
-            for par in rule.portalAccessRules:
-                if par.portal.idFaceId:
-                    try:
-                        await idface_client.request(
-                            "POST",
-                            "create_objects.fcgi",
-                            json={
-                                "object": "portal_access_rules",
-                                "values": [{
-                                    "portal_id": par.portal.idFaceId,
-                                    "access_rule_id": idface_rule_id
-                                }]
-                            }
-                        )
-                        synced_portals += 1
-                    except Exception as e:
-                        print(f"Erro ao vincular portal: {e}")
-            
-            return {
-                "success": True,
-                "message": "Regra sincronizada com sucesso",
-                "idFaceId": idface_rule_id,
-                "syncedTimeZones": synced_zones,
-                "syncedPortals": synced_portals
-            }
-    
+            # Tenta criar se não tiver ID, ou atualizar se tiver (simplificado para Create aqui)
+            res = await idface_client.create_access_rule(rule_payload)
+            if res.get('ids'):
+                # Sincroniza relacionamentos
+                await _sync_rule_relationships(idface_client, res['ids'][0], rule, db)
+                # Atualiza ID local se necessário
+                if not rule.idFaceId:
+                    await db.accessrule.update(where={"id": rule_id}, data={"idFaceId": res['ids'][0]})
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro ao sincronizar: {str(e)}"
-        )
+        print(f"Sync L1 Error: {e}")
 
-# ==================== Direct Time Zone Association ====================
-
-@router.post("/groups/{group_id}/time-zones/{tz_id}", status_code=status.HTTP_201_CREATED)
-async def link_time_zone_to_group(group_id: int, tz_id: int, db = Depends(get_db)):
-    """
-    Associa um Time Zone (horário) a um Group (departamento).
-    Internamente, encontra ou cria uma regra de acesso para o grupo e a vincula ao time zone.
-    """
-    group = await db.group.find_unique(where={"id": group_id})
-    if not group or not group.idFaceId:
-        raise HTTPException(status_code=404, detail="Grupo não encontrado ou não sincronizado.")
-
-    time_zone = await db.timezone.find_unique(where={"id": tz_id})
-    if not time_zone or not time_zone.idFaceId:
-        raise HTTPException(status_code=404, detail="Time Zone não encontrado ou não sincronizado.")
-
-    # Encontrar ou criar a regra de acesso para o grupo
-    rule_name = f"Regra para Grupo: {group.name}"
-    group_rule_link = await db.groupaccessrule.find_first(
-        where={"groupId": group_id},
-        include={"accessRule": True}
-    )
-
-    access_rule = None
-    if group_rule_link:
-        access_rule = group_rule_link.accessRule
-    else:
-        try:
-            # Cria a regra de acesso
-            access_rule = await db.accessrule.create(data={"name": rule_name, "type": 1, "priority": 10}) # Prioridade alta para grupos
-            async with idface_client:
-                # Sincroniza
-                res = await idface_client.create_access_rule({"name": rule_name, "type": 1, "priority": 10})
-                rule_idface_id = res['ids'][0]
-                access_rule = await db.accessrule.update(where={"id": access_rule.id}, data={"idFaceId": rule_idface_id})
-                
-                # Vincula grupo à regra
-                await db.groupaccessrule.create(data={"groupId": group.id, "accessRuleId": access_rule.id})
-                await idface_client.request("POST", "create_objects.fcgi", json={
-                    "object": "group_access_rules", "values": [{"group_id": group.idFaceId, "access_rule_id": rule_idface_id}]
-                })
-        except Exception as e:
-            if access_rule and access_rule.id:
-                await db.accessrule.delete(where={"id": access_rule.id})
-            raise HTTPException(status_code=500, detail=f"Erro ao criar/sincronizar regra para grupo: {e}")
-
-    # Vincular o time zone à regra de acesso
-    existing_link = await db.accessruletimezone.find_first(where={"accessRuleId": access_rule.id, "timeZoneId": tz_id})
-    if existing_link:
-        return {"success": True, "message": "Associação já existe."}
-
-    await db.accessruletimezone.create(data={"accessRuleId": access_rule.id, "timeZoneId": tz_id})
+    # Leitor 2
     try:
-        async with idface_client:
-            await idface_client.request("POST", "create_objects.fcgi", json={
-                "object": "access_rule_time_zones", "values": [{"access_rule_id": access_rule.idFaceId, "time_zone_id": time_zone.idFaceId}]
-            })
+        async with idface_client_2:
+            res = await idface_client_2.create_access_rule(rule_payload)
+            if res.get('ids'):
+                await _sync_rule_relationships(idface_client_2, res['ids'][0], rule, db)
     except Exception as e:
-        # Idealmente, faria rollback do accessruletimezone.create
-        raise HTTPException(status_code=500, detail=f"Erro ao sincronizar time zone com regra: {e}")
-
-    return {"success": True, "message": f"Time Zone '{time_zone.name}' associado ao Grupo '{group.name}'."}
-
-
-@router.delete("/groups/{group_id}/time-zones/{tz_id}", status_code=status.HTTP_200_OK)
-async def unlink_time_zone_from_group(group_id: int, tz_id: int, db = Depends(get_db)):
-    """
-    Desassocia um Time Zone de um Group, procurando em todas as regras do grupo.
-    """
-    group_rule_links = await db.groupaccessrule.find_many(where={"groupId": group_id})
-    if not group_rule_links:
-        raise HTTPException(status_code=404, detail="Nenhuma regra de acesso encontrada para este grupo.")
-
-    rule_ids = [link.accessRuleId for link in group_rule_links]
-
-    tz_links_to_delete = await db.accessruletimezone.find_many(
-        where={"timeZoneId": tz_id, "accessRuleId": {"in": rule_ids}},
-        include={"accessRule": True, "timeZone": True}
-    )
-
-    if not tz_links_to_delete:
-        raise HTTPException(status_code=404, detail="Associação entre este grupo e time zone não encontrada.")
-
-    deleted_count = 0
-    for link in tz_links_to_delete:
-        if link.accessRule.idFaceId and link.timeZone.idFaceId:
-            try:
-                async with idface_client:
-                    await idface_client.request("POST", "destroy_objects.fcgi", json={
-                        "object": "access_rule_time_zones",
-                        "where": {"access_rule_time_zones": {"access_rule_id": link.accessRule.idFaceId, "time_zone_id": link.timeZone.idFaceId}}
-                    })
-            except Exception as e:
-                print(f"Aviso: Falha ao deletar vínculo no iDFace: {e}")
-        
-        await db.accessruletimezone.delete(where={"id": link.id})
-        deleted_count += 1
+        print(f"Sync L2 Error: {e}")
     
-    return {"success": True, "message": f"{deleted_count} associação(ões) removida(s)."}
-
-
-@router.post("/users/{user_id}/time-zones/{tz_id}", status_code=status.HTTP_201_CREATED)
-async def link_time_zone_to_user(user_id: int, tz_id: int, db = Depends(get_db)):
-    """
-    Associa um Time Zone diretamente a um User.
-    Cria uma regra de acesso individual para o usuário se necessário.
-    """
-    user = await db.user.find_unique(where={"id": user_id})
-    if not user or not user.idFaceId:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado ou não sincronizado.")
-
-    time_zone = await db.timezone.find_unique(where={"id": tz_id})
-    if not time_zone or not time_zone.idFaceId:
-        raise HTTPException(status_code=404, detail="Time Zone não encontrado ou não sincronizado.")
-
-    # Encontrar ou criar a regra de acesso para o usuário
-    rule_name = f"Regra Individual para: {user.name} (id: {user.id})"
-    user_rule_link = await db.useraccessrule.find_first(
-        where={"userId": user_id, "accessRule": {"name": rule_name}},
-        include={"accessRule": True}
-    )
-
-    access_rule = None
-    if user_rule_link:
-        access_rule = user_rule_link.accessRule
-    else:
-        try:
-            access_rule = await db.accessrule.create(data={"name": rule_name, "type": 1, "priority": 5}) # Prioridade média
-            async with idface_client:
-                res = await idface_client.create_access_rule({"name": rule_name, "type": 1, "priority": 5})
-                rule_idface_id = res['ids'][0]
-                access_rule = await db.accessrule.update(where={"id": access_rule.id}, data={"idFaceId": rule_idface_id})
-                
-                await db.useraccessrule.create(data={"userId": user.id, "accessRuleId": access_rule.id})
-                await idface_client.request("POST", "create_objects.fcgi", json={
-                    "object": "user_access_rules", "values": [{"user_id": user.idFaceId, "access_rule_id": rule_idface_id}]
-                })
-        except Exception as e:
-            if access_rule and access_rule.id:
-                await db.accessrule.delete(where={"id": access_rule.id})
-            raise HTTPException(status_code=500, detail=f"Erro ao criar/sincronizar regra para usuário: {e}")
-
-    # Vincular o time zone à regra
-    existing_link = await db.accessruletimezone.find_first(where={"accessRuleId": access_rule.id, "timeZoneId": tz_id})
-    if existing_link:
-        return {"success": True, "message": "Associação já existe."}
-
-    await db.accessruletimezone.create(data={"accessRuleId": access_rule.id, "timeZoneId": tz_id})
-    try:
-        async with idface_client:
-            await idface_client.request("POST", "create_objects.fcgi", json={
-                "object": "access_rule_time_zones", "values": [{"access_rule_id": access_rule.idFaceId, "time_zone_id": time_zone.idFaceId}]
-            })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao sincronizar time zone com regra: {e}")
-
-    return {"success": True, "message": f"Time Zone '{time_zone.name}' associado ao Usuário '{user.name}'."}
-
-
-@router.delete("/users/{user_id}/time-zones/{tz_id}", status_code=status.HTTP_200_OK)
-async def unlink_time_zone_from_user(user_id: int, tz_id: int, db = Depends(get_db)):
-    """
-    Desassocia um Time Zone de um User, procurando em todas as regras vinculadas ao usuário.
-    """
-    user_rule_links = await db.useraccessrule.find_many(where={"userId": user_id})
-    if not user_rule_links:
-        raise HTTPException(status_code=404, detail="Usuário não vinculado a nenhuma regra de acesso.")
-
-    rule_ids = [link.accessRuleId for link in user_rule_links]
-    
-    tz_links_to_delete = await db.accessruletimezone.find_many(
-        where={"timeZoneId": tz_id, "accessRuleId": {"in": rule_ids}},
-        include={"accessRule": True, "timeZone": True}
-    )
-
-    if not tz_links_to_delete:
-        raise HTTPException(status_code=404, detail="Associação entre este usuário e time zone não encontrada.")
-
-    deleted_count = 0
-    for link in tz_links_to_delete:
-        if link.accessRule.idFaceId and link.timeZone.idFaceId:
-            try:
-                async with idface_client:
-                    await idface_client.request("POST", "destroy_objects.fcgi", json={
-                        "object": "access_rule_time_zones",
-                        "where": {"access_rule_time_zones": {"access_rule_id": link.accessRule.idFaceId, "time_zone_id": link.timeZone.idFaceId}}
-                    })
-            except Exception as e:
-                print(f"Aviso: Falha ao deletar vínculo no iDFace: {e}")
-        
-        await db.accessruletimezone.delete(where={"id": link.id})
-        deleted_count += 1
-    
-    return {"success": True, "message": f"{deleted_count} associação(ões) removida(s)."}
+    return {"success": True, "message": "Sincronização disparada para ambos os leitores"}
 
 
 # ==================== User-Rule Management ====================
 
 @router.post("/{rule_id}/users/{user_id}", status_code=status.HTTP_201_CREATED)
-async def link_user_to_rule(
-    rule_id: int,
-    user_id: int,
-    db = Depends(get_db)
-):
-    """
-    Vincula um usuário diretamente a uma regra de acesso.
-    """
-    # Verificações
+async def link_user_to_rule(rule_id: int, user_id: int, db = Depends(get_db)):
     rule = await db.accessrule.find_unique(where={"id": rule_id})
-    if not rule:
-        raise HTTPException(status_code=404, detail="Regra de acesso não encontrada")
-
     user = await db.user.find_unique(where={"id": user_id})
-    if not user:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    
+    if not rule or not user:
+        raise HTTPException(status_code=404, detail="Regra ou Usuário não encontrado")
 
-    # Verificar duplicata
-    existing = await db.useraccessrule.find_first(
-        where={"userId": user_id, "accessRuleId": rule_id}
-    )
+    existing = await db.useraccessrule.find_first(where={"userId": user_id, "accessRuleId": rule_id})
     if existing:
-        raise HTTPException(status_code=400, detail="Usuário já vinculado diretamente a esta regra")
+        raise HTTPException(status_code=400, detail="Vínculo já existe")
 
-    # Criar vínculo local
-    await db.useraccessrule.create(
-        data={"userId": user_id, "accessRuleId": rule_id}
-    )
+    await db.useraccessrule.create(data={"userId": user_id, "accessRuleId": rule_id})
 
-    # Sincronizar com iDFace
     if rule.idFaceId and user.idFaceId:
-        try:
-            async with idface_client:
-                await idface_client.request(
-                    "POST",
-                    "create_objects.fcgi",
-                    json={
-                        "object": "user_access_rules",
-                        "values": [{
-                            "user_id": user.idFaceId,
-                            "access_rule_id": rule.idFaceId
-                        }]
-                    }
-                )
-        except Exception as e:
-            print(f"Aviso: Erro ao sincronizar vínculo de usuário com iDFace: {e}")
+        req_data = {
+            "object": "user_access_rules",
+            "values": [{"user_id": user.idFaceId, "access_rule_id": rule.idFaceId}]
+        }
+        # L1
+        await _safe_request(idface_client, "POST", "create_objects.fcgi", json=req_data)
+        # L2
+        await _safe_request(idface_client_2, "POST", "create_objects.fcgi", json=req_data)
 
-    return {"success": True, "message": f"Usuário '{user.name}' vinculado à regra '{rule.name}'"}
+    return {"success": True, "message": "Usuário vinculado com sucesso"}
 
 
 @router.delete("/{rule_id}/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def unlink_user_from_rule(rule_id: int, user_id: int, db = Depends(get_db)):
-    """
-    Remove o vínculo direto entre um usuário e uma regra de acesso.
-    """
-    # Encontrar o vínculo no banco local
     link = await db.useraccessrule.find_first(
         where={"userId": user_id, "accessRuleId": rule_id},
         include={"user": True, "accessRule": True}
     )
     
     if not link:
-        raise HTTPException(status_code=404, detail="Vínculo entre usuário e regra não encontrado")
+        raise HTTPException(status_code=404, detail="Vínculo não encontrado")
 
-    # Deletar do iDFace primeiro
-    if link.accessRule and link.accessRule.idFaceId and link.user and link.user.idFaceId:
-        try:
-            async with idface_client:
-                await idface_client.request(
-                    "POST",
-                    "destroy_objects.fcgi",
-                    json={
-                        "object": "user_access_rules",
-                        "where": {
-                            "user_access_rules": {
-                                "user_id": link.user.idFaceId,
-                                "access_rule_id": link.accessRule.idFaceId
-                            }
-                        }
-                    }
-                )
-        except Exception as e:
-            print(f"Aviso: Erro ao remover vínculo de usuário no iDFace: {e}")
+    if link.accessRule.idFaceId and link.user.idFaceId:
+        req_data = {
+            "object": "user_access_rules",
+            "where": {"user_access_rules": {"user_id": link.user.idFaceId, "access_rule_id": link.accessRule.idFaceId}}
+        }
+        # L1
+        await _safe_request(idface_client, "POST", "destroy_objects.fcgi", json=req_data)
+        # L2
+        await _safe_request(idface_client_2, "POST", "destroy_objects.fcgi", json=req_data)
 
-    # Deletar do banco local
     await db.useraccessrule.delete(where={"id": link.id})

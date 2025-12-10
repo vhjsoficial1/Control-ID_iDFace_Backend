@@ -4,7 +4,7 @@ Contém operações complexas e validações de regras de acesso
 """
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
-from app.utils.idface_client import idface_client
+from app.utils.idface_client import idface_client, idface_client_2
 import logging
 
 logger = logging.getLogger(__name__)

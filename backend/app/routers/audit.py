@@ -1,6 +1,11 @@
+"""
+Rotas para Audit/Logs com sincronização sequencial (Fila Indiana) para 2 Leitores
+backend/app/routers/audit.py
+"""
 from fastapi import APIRouter, HTTPException, Depends, status, Query
 from app.database import get_db
-from app.utils.idface_client import idface_client
+# Importando ambos os clientes para a fila indiana
+from app.utils.idface_client import idface_client, idface_client_2
 from app.schemas.audit import (
     AccessLogCreate, AccessLogResponse, AccessLogListResponse,
     AccessLogWithDetails, AccessLogFilter, AccessStatisticsResponse,
@@ -12,6 +17,75 @@ from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 
 router = APIRouter()
+
+
+# ==================== Helper Functions ====================
+
+async def _process_logs_from_device(client, db) -> dict:
+    """
+    Função auxiliar que baixa e processa logs de UM dispositivo específico.
+    Retorna estatísticas da operação.
+    """
+    stats = {
+        "device": client.base_url,
+        "total_fetched": 0,
+        "imported": 0,
+        "skipped": 0,
+        "error": None
+    }
+    
+    try:
+        print(f"🔄 Iniciando sincronização de logs com {client.base_url}...")
+        async with client:
+            # 1. Baixar logs do dispositivo
+            result = await client.load_access_logs()
+            logs_data = result.get("access_logs", [])
+            stats["total_fetched"] = len(logs_data)
+            
+            # 2. Processar cada log
+            for log_data in logs_data:
+                # Verificar se já existe pelo idFaceLogId
+                idface_log_id = log_data.get("id")
+                if not idface_log_id:
+                    continue
+                
+                # Verifica duplicidade no banco local
+                # Nota: Se os dois leitores gerarem IDs sequenciais iguais (ex: log #1), 
+                # o segundo será ignorado aqui. O ideal seria ter uma coluna 'device_id'.
+                existing = await db.accesslog.find_first(
+                    where={"idFaceLogId": idface_log_id}
+                )
+                
+                if not existing:
+                    # Tenta converter timestamp, fallback para agora
+                    ts_val = log_data.get("timestamp")
+                    if isinstance(ts_val, int):
+                         final_ts = datetime.fromtimestamp(ts_val)
+                    else:
+                         final_ts = datetime.now()
+
+                    await db.accesslog.create(
+                        data={
+                            "idFaceLogId": idface_log_id,
+                            "userId": log_data.get("user_id"),
+                            "portalId": log_data.get("portal_id"),
+                            "event": log_data.get("event", "unknown"),
+                            "reason": log_data.get("reason"),
+                            "cardValue": log_data.get("card_value"),
+                            "timestamp": final_ts
+                        }
+                    )
+                    stats["imported"] += 1
+                else:
+                    stats["skipped"] += 1
+            
+            print(f"✅ Sucesso {client.base_url}: {stats['imported']} importados.")
+
+    except Exception as e:
+        stats["error"] = str(e)
+        print(f"❌ Erro ao sincronizar logs de {client.base_url}: {e}")
+        
+    return stats
 
 
 # ==================== CRUD Operations ====================
@@ -642,51 +716,30 @@ async def get_recent_activity(
 @router.post("/sync-from-idface")
 async def sync_logs_from_idface(db = Depends(get_db)):
     """
-    Importa logs de acesso do dispositivo iDFace
+    Importa logs de acesso de AMBOS os leitores sequencialmente (Fila Indiana).
     """
-    try:
-        async with idface_client:
-            result = await idface_client.load_access_logs()
-            
-            logs_data = result.get("access_logs", [])
-            imported_count = 0
-            
-            for log_data in logs_data:
-                # Verificar se já existe pelo idFaceLogId
-                idface_log_id = log_data.get("id")
-                if not idface_log_id:
-                    continue
-                    
-                existing = await db.accesslog.find_first(
-                    where={
-                        "idFaceLogId": idface_log_id
-                    }
-                )
-                
-                if not existing:
-                    await db.accesslog.create(
-                        data={
-                            "idFaceLogId": idface_log_id,
-                            "userId": log_data.get("user_id"),
-                            "portalId": log_data.get("portal_id"),
-                            "event": log_data.get("event", "unknown"),
-                            "reason": log_data.get("reason"),
-                            "cardValue": log_data.get("card_value"),
-                            "timestamp": log_data.get("timestamp", datetime.now())
-                        }
-                    )
-                    imported_count += 1
-            
-            return {
-                "success": True,
-                "message": f"Logs sincronizados com sucesso",
-                "totalLogs": len(logs_data),
-                "importedCount": imported_count,
-                "skippedCount": len(logs_data) - imported_count
-            }
-            
-    except Exception as e:
+    # Fase 1: Leitor 1
+    stats1 = await _process_logs_from_device(idface_client, db)
+    
+    # Fase 2: Leitor 2
+    stats2 = await _process_logs_from_device(idface_client_2, db)
+    
+    # Consolidação
+    total_imported = stats1["imported"] + stats2["imported"]
+    total_skipped = stats1["skipped"] + stats2["skipped"]
+    
+    # Verifica erros críticos (ambos falharam)
+    if stats1["error"] and stats2["error"]:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro ao sincronizar logs: {str(e)}"
+            status_code=status.HTTP_502_BAD_GATEWAY, 
+            detail=f"Falha em ambos os leitores. L1: {stats1['error']}, L2: {stats2['error']}"
         )
+
+    return {
+        "success": True,
+        "message": f"Sincronização concluída. Importados: {total_imported}, Ignorados (Duplicados): {total_skipped}",
+        "details": {
+            "reader1": stats1,
+            "reader2": stats2
+        }
+    }

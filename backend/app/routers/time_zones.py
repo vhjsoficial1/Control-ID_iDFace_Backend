@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from app.database import get_db
-from app.utils.idface_client import idface_client
+from app.utils.idface_client import idface_client, idface_client_2
 from app.services.time_zone_service import TimeZoneService
 from typing import Optional, List
 

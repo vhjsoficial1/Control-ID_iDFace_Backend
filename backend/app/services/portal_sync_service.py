@@ -1,5 +1,6 @@
 from app.database import db, connect_db, disconnect_db
-from app.utils.idface_client import idface_client
+# Importando ambos os clientes
+from app.utils.idface_client import idface_client, idface_client_2
 import logging
 
 logger = logging.getLogger(__name__)
@@ -18,67 +19,88 @@ class PortalSyncService:
 
     async def sync_portals_from_device(self):
         """
-        Busca áreas no iDFace e atualiza a tabela Portal no banco local
+        Busca áreas nos iDFaces (L1 e L2) e atualiza a tabela Portal no banco local.
+        Execução em Fila Indiana.
         """
-        stats = {"synced": 0, "created": 0, "updated": 0, "portals": []}
+        stats = {"synced": 0, "created": 0, "updated": 0, "portals": [], "errors": []}
         
         try:
-            # 1. Garantir conexão
+            # 1. Garantir conexão com banco
             await self.ensure_connection()
 
-            # 2. Buscar áreas no dispositivo
-            print("📡 Buscando dados no equipamento (load_objects)...")
-            response = await idface_client.request("POST", "load_objects.fcgi", json={"object": "areas"})
-            areas = response.get("areas", [])
-            
-            if not areas:
-                return {"success": False, "error": "Nenhuma área encontrada no dispositivo"}
-
-            print(f"📋 Encontradas {len(areas)} áreas no equipamento.")
-
-            # 3. Sincronizar com o banco local
-            for area in areas:
-                area_id = area.get("id")
-                area_name = area.get("name")
-                
-                if not area_id: continue
-
+            # Função auxiliar para processar um dispositivo específico
+            async def _process_client(client, label):
+                print(f"📡 Buscando dados em {label} (load_objects)...")
                 try:
-                    # Tenta achar pelo ID do iDFace
-                    # Nota: O campo no banco é idFaceId para mapear com o ID externo
-                    existing = await db.portal.find_first(where={"idFaceId": area_id})
-                    
-                    status = "unchanged"
-                    
-                    if existing:
-                        if existing.name != area_name:
-                            await db.portal.update(
-                                where={"id": existing.id},
-                                data={"name": area_name}
-                            )
-                            status = "updated"
-                            stats["updated"] += 1
-                    else:
-                        await db.portal.create(
-                            data={
-                                "idFaceId": area_id,
-                                "name": area_name
-                            }
-                        )
-                        status = "created"
-                        stats["created"] += 1
-                    
-                    stats["synced"] += 1
-                    stats["portals"].append({
-                        "id": area_id, 
-                        "name": area_name, 
-                        "status": status
-                    })
-                except Exception as e_inner:
-                    print(f"❌ Erro ao processar portal #{area_id}: {e_inner}")
-                    # Tenta reconectar se o erro for de conexão perdida
-                    if "Client is not connected" in str(e_inner):
-                        await self.ensure_connection()
+                    async with client:
+                        response = await client.request("POST", "load_objects.fcgi", json={"object": "areas"})
+                        areas = response.get("areas", [])
+                        
+                        if not areas:
+                            print(f"ℹ️ Nenhuma área encontrada em {label}")
+                            return
+
+                        print(f"📋 Encontradas {len(areas)} áreas em {label}.")
+
+                        # Sincronizar com o banco local
+                        for area in areas:
+                            area_id = area.get("id")
+                            area_name = area.get("name")
+                            
+                            if not area_id: continue
+
+                            try:
+                                # Tenta achar pelo ID do iDFace
+                                existing = await db.portal.find_first(where={"idFaceId": area_id})
+                                
+                                status_op = "unchanged"
+                                
+                                if existing:
+                                    if existing.name != area_name:
+                                        await db.portal.update(
+                                            where={"id": existing.id},
+                                            data={"name": area_name}
+                                        )
+                                        status_op = "updated"
+                                        stats["updated"] += 1
+                                else:
+                                    await db.portal.create(
+                                        data={
+                                            "idFaceId": area_id,
+                                            "name": area_name
+                                        }
+                                    )
+                                    status_op = "created"
+                                    stats["created"] += 1
+                                
+                                # Evita duplicar na lista de retorno se já processado pelo L1
+                                if not any(p['id'] == area_id for p in stats["portals"]):
+                                    stats["synced"] += 1
+                                    stats["portals"].append({
+                                        "id": area_id, 
+                                        "name": area_name, 
+                                        "status": status_op,
+                                        "source": label
+                                    })
+                                    
+                            except Exception as e_inner:
+                                print(f"❌ Erro ao processar portal #{area_id} de {label}: {e_inner}")
+                                # Tenta reconectar se o erro for de conexão perdida com o banco
+                                if "Client is not connected" in str(e_inner):
+                                    await self.ensure_connection()
+
+                except Exception as e_client:
+                    error_msg = f"Erro ao conectar com {label}: {e_client}"
+                    print(f"❌ {error_msg}")
+                    stats["errors"].append(error_msg)
+
+            # --- FILA INDIANA ---
+            
+            # 1. Processa Leitor 1
+            await _process_client(idface_client, "Leitor 1")
+            
+            # 2. Processa Leitor 2
+            await _process_client(idface_client_2, "Leitor 2")
 
             return {"success": True, **stats}
 

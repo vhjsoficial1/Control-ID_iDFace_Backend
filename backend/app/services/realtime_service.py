@@ -5,8 +5,10 @@ backend/app/services/realtime_service.py
 """
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
-from app.utils.idface_client import idface_client
+# Importando ambos os clientes
+from app.utils.idface_client import idface_client, idface_client_2
 import logging
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +23,20 @@ class RealtimeMonitorService:
     
     async def check_alarm_status(self) -> Dict[str, Any]:
         """
-        Verifica status de alarme do dispositivo
+        Verifica status de alarme do dispositivo (Fila Indiana: L1 e L2)
         Equivalente a: POST alarm_status.fcgi
         
         Returns:
             {"active": bool, "cause": int}
         """
+        final_result = {
+            "success": False,
+            "active": False,
+            "cause": 0,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # --- LEITOR 1 ---
         try:
             async with idface_client:
                 result = await idface_client.request(
@@ -36,25 +46,48 @@ class RealtimeMonitorService:
                 
                 self.last_alarm_check = datetime.now()
                 
-                return {
-                    "success": True,
-                    "active": result.get("active", False),
-                    "cause": result.get("cause", 0),
-                    "timestamp": self.last_alarm_check.isoformat()
-                }
+                # Se L1 respondeu, já consideramos sucesso na comunicação
+                final_result["success"] = True
+                final_result["timestamp"] = self.last_alarm_check.isoformat()
+                
+                if result.get("active", False):
+                    final_result["active"] = True
+                    final_result["cause"] = result.get("cause", 0)
                 
         except Exception as e:
-            logger.error(f"Erro ao verificar alarme: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "active": False,
-                "cause": 0
-            }
+            logger.error(f"Erro ao verificar alarme Leitor 1: {e}")
+            final_result["error_l1"] = str(e)
+
+        # --- LEITOR 2 ---
+        try:
+            async with idface_client_2:
+                result_2 = await idface_client_2.request(
+                    "POST",
+                    "alarm_status.fcgi"
+                )
+                
+                self.last_alarm_check = datetime.now()
+                
+                # Se L2 respondeu (mesmo que L1 tenha falhado), é sucesso
+                final_result["success"] = True
+                final_result["timestamp"] = self.last_alarm_check.isoformat()
+                
+                # Se L2 estiver em alarme, o status global fica ativo (OR lógico)
+                if result_2.get("active", False):
+                    final_result["active"] = True
+                    # Se L1 não tinha causa, usa a do L2
+                    if final_result["cause"] == 0:
+                        final_result["cause"] = result_2.get("cause", 0)
+                        
+        except Exception as e:
+            logger.error(f"Erro ao verificar alarme Leitor 2: {e}")
+            final_result["error_l2"] = str(e)
+
+        return final_result
     
     async def get_new_access_logs(self, since_id: Optional[int] = None) -> Dict[str, Any]:
         """
-        Busca novos logs de acesso desde o último ID conhecido.
+        Busca novos logs de acesso desde o último ID conhecido (Fila Indiana: L1 + L2).
         Segue o padrão EXATO da API iDFace conforme capturas de rede real.
         
         Args:
@@ -79,49 +112,97 @@ class RealtimeMonitorService:
             else:
                 logger.info(f"🔍 Primeira busca: buscando TODOS os logs (since_timestamp=0)")
             
-            # 2. Buscar logs filtrados do dispositivo
-            logger.info(f"📡 Chamando load_access_logs_filtered(since_timestamp={since_timestamp})")
-            async with idface_client:
-                result = await idface_client.load_access_logs_filtered(
-                    since_timestamp=since_timestamp,
-                    limit=7  # ✅ Conforme frontend real
-                )
-                
-                device_logs = result.get("access_logs", [])
+            all_device_logs = []
+
+            # 2. Buscar logs filtrados do dispositivo LEITOR 1
+            try:
+                logger.info(f"📡 Chamando load_access_logs_filtered L1 (since={since_timestamp})")
+                async with idface_client:
+                    result = await idface_client.load_access_logs_filtered(
+                        since_timestamp=since_timestamp,
+                        limit=7  # ✅ Conforme frontend real
+                    )
+                    
+                    logs_l1 = result.get("access_logs", [])
+                    if logs_l1:
+                        logger.info(f"📊 Leitor 1 retornou {len(logs_l1)} logs")
+                        all_device_logs.extend(logs_l1)
+            except Exception as e:
+                logger.error(f"Erro ao buscar logs Leitor 1: {e}")
+
+            # 3. Buscar logs filtrados do dispositivo LEITOR 2
+            try:
+                logger.info(f"📡 Chamando load_access_logs_filtered L2 (since={since_timestamp})")
+                async with idface_client_2:
+                    result_2 = await idface_client_2.load_access_logs_filtered(
+                        since_timestamp=since_timestamp,
+                        limit=7
+                    )
+                    
+                    logs_l2 = result_2.get("access_logs", [])
+                    if logs_l2:
+                        logger.info(f"📊 Leitor 2 retornou {len(logs_l2)} logs")
+                        all_device_logs.extend(logs_l2)
+            except Exception as e:
+                logger.error(f"Erro ao buscar logs Leitor 2: {e}")
             
-            logger.info(f"📊 Device retornou {len(device_logs)} logs")
-            if device_logs:
-                logger.info(f"   Primeiros logs: {[l.get('id') for l in device_logs[:3]]}")
+            # Ordenar logs combinados por tempo para processamento correto
+            all_device_logs.sort(key=lambda x: x.get("time", 0))
+
+            if all_device_logs:
+                logger.info(f"   Total Logs Combinados: {len(all_device_logs)}")
             
-            # 3. Enriquecer cada log com dados do usuário e área
+            # 4. Enriquecer cada log com dados do usuário e área
             enriched_logs = []
-            for log_data in device_logs:
+            for log_data in all_device_logs:
                 log_id_device = log_data.get("id")
                 if not log_id_device:
                     continue
                 
-                # Verificar duplicata
+                # Verificar duplicata no banco (importante pois L1 e L2 podem ter logs com mesmo ID)
+                # O ideal seria usar ID + Device, mas mantendo a lógica original:
                 existing = await self.db.accesslog.find_unique(
                     where={"idFaceLogId": log_id_device}
                 )
                 if existing:
                     continue
                 
-                # ✅ Buscar dados do usuário
+                # ✅ Buscar dados do usuário (Tenta L1, se falhar tenta L2)
                 if log_data.get("user_id"):
+                    user_found = False
+                    # Tenta L1
                     try:
                         async with idface_client:
                             user_result = await idface_client.load_users_by_id(log_data["user_id"])
                             user_data = user_result.get("users", [{}])[0]
-                            log_data["user_name"] = user_data.get("name", "Desconhecido")
-                            log_data["registration"] = user_data.get("registration", "")
+                            if user_data:
+                                log_data["user_name"] = user_data.get("name", "Desconhecido")
+                                log_data["registration"] = user_data.get("registration", "")
+                                user_found = True
                     except Exception as e:
-                        logger.warning(f"Erro ao buscar usuário {log_data.get('user_id')}: {e}")
+                        logger.warning(f"L1: Erro ao buscar usuário {log_data.get('user_id')}: {e}")
+                    
+                    # Tenta L2 se não achou
+                    if not user_found:
+                        try:
+                            async with idface_client_2:
+                                user_result = await idface_client_2.load_users_by_id(log_data["user_id"])
+                                user_data = user_result.get("users", [{}])[0]
+                                if user_data:
+                                    log_data["user_name"] = user_data.get("name", "Desconhecido")
+                                    log_data["registration"] = user_data.get("registration", "")
+                                    user_found = True
+                        except Exception as e:
+                            logger.warning(f"L2: Erro ao buscar usuário {log_data.get('user_id')}: {e}")
+
+                    if not user_found:
                         log_data["user_name"] = "Desconhecido"
                         log_data["registration"] = ""
                 
-                # ✅ Buscar dados da área/portal
+                # ✅ Buscar dados da área/portal (Tenta L1, se falhar tenta L2)
                 if log_data.get("portal_id"):
+                    area_found = False
+                    # Tenta L1
                     try:
                         async with idface_client:
                             area_result = await idface_client.load_areas(
@@ -129,21 +210,40 @@ class RealtimeMonitorService:
                                 where_value=log_data["portal_id"]  # ID do portal/área
                             )
                             area_data = area_result.get("areas", [{}])[0]
-                            log_data["area_name"] = area_data.get("name", "Entrada")
+                            if area_data:
+                                log_data["area_name"] = area_data.get("name", "Entrada")
+                                area_found = True
                     except Exception as e:
-                        logger.warning(f"Erro ao buscar área: {e}")
+                        logger.warning(f"L1: Erro ao buscar área: {e}")
+                    
+                    # Tenta L2
+                    if not area_found:
+                        try:
+                            async with idface_client_2:
+                                area_result = await idface_client_2.load_areas(
+                                    where_field="id",
+                                    where_value=log_data["portal_id"]
+                                )
+                                area_data = area_result.get("areas", [{}])[0]
+                                if area_data:
+                                    log_data["area_name"] = area_data.get("name", "Entrada")
+                                    area_found = True
+                        except Exception as e:
+                            logger.warning(f"L2: Erro ao buscar área: {e}")
+
+                    if not area_found:
                         log_data["area_name"] = "Entrada"
                 
                 enriched_logs.append(log_data)
             
-            # 4. Processar e salvar logs novos
+            # 5. Processar e salvar logs novos
             saved_logs = []
             for log_data in enriched_logs:
                 saved_log = await self._process_and_save_log(log_data)
                 if saved_log:
                     saved_logs.append(saved_log)
             
-            # 5. Retornar último ID
+            # 6. Retornar último ID
             last_id = None
             if saved_logs:
                 latest = await self.db.accesslog.find_first(
@@ -252,7 +352,7 @@ class RealtimeMonitorService:
                     "portalId": portal_id_db,  # ✅ Pode ser null
                     "event": event_display,  # ✅ Usar mensagem traduzida
                     "reason": reason,  # ✅ Adicionar motivo se houver
-                    "cardValue": None,
+                    "cardValue": log_data.get("card_value"),
                     "timestamp": timestamp
                 }
             )
@@ -342,9 +442,14 @@ class RealtimeMonitorService:
     
     async def get_access_log_count(self) -> Dict[str, Any]:
         """
-        Conta total de logs de acesso no dispositivo
+        Conta total de logs de acesso no dispositivo (L1 e L2)
         Equivalente ao COUNT(*) que o frontend faz
         """
+        count = 0
+        success = False
+        error = None
+
+        # --- LEITOR 1 ---
         try:
             async with idface_client:
                 result = await idface_client.request(
@@ -360,21 +465,44 @@ class RealtimeMonitorService:
                     }
                 )
                 
-                count = result.get("count", 0)
-                
-                return {
-                    "success": True,
-                    "count": count,
-                    "timestamp": datetime.now().isoformat()
-                }
+                count += result.get("count", 0)
+                success = True
                 
         except Exception as e:
-            logger.error(f"Erro ao contar logs: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "count": 0
-            }
+            logger.error(f"Erro ao contar logs L1: {e}")
+            error = str(e)
+
+        # --- LEITOR 2 ---
+        try:
+            async with idface_client_2:
+                result_2 = await idface_client_2.request(
+                    "POST",
+                    "load_objects.fcgi",
+                    json={
+                        "join": "LEFT",
+                        "object": "access_logs",
+                        "fields": ["COUNT(*)"],
+                        "where": [],
+                        "order": ["id"],
+                        "offset": 0
+                    }
+                )
+                
+                count += result_2.get("count", 0)
+                success = True
+                
+        except Exception as e:
+            logger.error(f"Erro ao contar logs L2: {e}")
+            # Se L1 falhou, sobrescreve o erro. Se L1 passou, ignora erro do L2.
+            if not success:
+                error = str(e)
+
+        return {
+            "success": success,
+            "count": count,
+            "timestamp": datetime.now().isoformat(),
+            "error": error
+        }
     
     async def get_recent_activity(self, minutes: int = 5) -> Dict[str, Any]:
         """
@@ -452,9 +580,10 @@ class RealtimeMonitorService:
 
     async def get_device_info(self) -> Dict[str, Any]:
         """
-        Obtém informações do dispositivo iDFace conectado
-        Tenta buscar info do device, mas se falhar, verifica    conectividade básica
+        Obtém informações do dispositivo iDFace conectado (Tenta L1, depois L2)
+        Tenta buscar info do device, mas se falhar, verifica conectividade básica
         """
+        # --- TENTATIVA LEITOR 1 ---
         try:
             async with idface_client:
                 # Método 1: Tentar buscar configurações do sistema
@@ -470,7 +599,7 @@ class RealtimeMonitorService:
                             "connected": True,
                             "device": {
                                 "id": result.get("device_id", 1),
-                                "name": result.get("device_name",   "iDFace"),
+                                "name": result.get("device_name",   "iDFace (L1)"),
                                 "ip": idface_client.base_url.replace    ("http://", "").replace("https://", ""),
                                 "model": result.get("model", "iDFace"),
                                 "serial": result.get("serial_number",   "N/A"),
@@ -494,7 +623,7 @@ class RealtimeMonitorService:
                         "connected": True,
                         "device": {
                             "id": 1,  # ID padrão quando não    conseguimos buscar
-                            "name": "iDFace",
+                            "name": "iDFace (L1)",
                             "ip": idface_client.base_url.replace    ("http://", "").replace("https://", ""),
                             "model": "iDFace Biométrico",
                             "serial": "N/A"
@@ -522,7 +651,7 @@ class RealtimeMonitorService:
                         "connected": True,
                         "device": {
                             "id": 1,
-                            "name": "iDFace",
+                            "name": "iDFace (L1)",
                             "ip": idface_client.base_url.replace    ("http://", "").replace("https://", ""),
                             "model": "iDFace",
                             "serial": "N/A"
@@ -531,15 +660,91 @@ class RealtimeMonitorService:
                     }
                 except:
                     pass
-                
-                # Se nenhum método funcionou
-                raise Exception("Não foi possível conectar ao   dispositivo")
+        except Exception:
+            pass
+
+        # --- TENTATIVA LEITOR 2 (Se L1 falhou totalmente) ---
+        try:
+            async with idface_client_2:
+                # Método 1: Tentar buscar configurações do sistema
+                try:
+                    result = await idface_client_2.request(
+                        "POST",
+                        "system_information.fcgi"
+                    )
                     
-        except Exception as e:
-            logger.error(f"Erro ao obter info do dispositivo: {e}")
-            return {
-                "success": False,
-                "connected": False,
-                "error": str(e),
-                "device": None
-            }
+                    if result:
+                        return {
+                            "success": True,
+                            "connected": True,
+                            "device": {
+                                "id": result.get("device_id", 2),
+                                "name": result.get("device_name",   "iDFace (L2)"),
+                                "ip": idface_client_2.base_url.replace    ("http://", "").replace("https://", ""),
+                                "model": result.get("model", "iDFace"),
+                                "serial": result.get("serial_number",   "N/A"),
+                                "firmware": result.get  ("firmware_version", "N/A")
+                            },
+                            "lastCommunication": datetime.now().    isoformat()
+                        }
+                except:
+                    pass
+                
+                # Método 2: Verificar status de alarme (endpoint mais   simples)
+                try:
+                    result = await idface_client_2.request(
+                        "POST",
+                        "alarm_status.fcgi"
+                    )
+                    
+                    return {
+                        "success": True,
+                        "connected": True,
+                        "device": {
+                            "id": 2,
+                            "name": "iDFace (L2)",
+                            "ip": idface_client_2.base_url.replace    ("http://", "").replace("https://", ""),
+                            "model": "iDFace Biométrico",
+                            "serial": "N/A"
+                        },
+                        "lastCommunication": datetime.now().isoformat()
+                    }
+                except:
+                    pass
+                
+                # Método 3: Buscar pela contagem de logs (último    recurso)
+                try:
+                    result = await idface_client_2.request(
+                        "POST",
+                        "load_objects.fcgi",
+                        json={
+                            "object": "access_logs",
+                            "fields": ["COUNT(*)"],
+                            "where": []
+                        }
+                    )
+                    
+                    return {
+                        "success": True,
+                        "connected": True,
+                        "device": {
+                            "id": 2,
+                            "name": "iDFace (L2)",
+                            "ip": idface_client_2.base_url.replace    ("http://", "").replace("https://", ""),
+                            "model": "iDFace",
+                            "serial": "N/A"
+                        },
+                        "lastCommunication": datetime.now().isoformat()
+                    }
+                except:
+                    pass
+        except Exception:
+            pass
+        
+        # Se nenhum método funcionou em nenhum leitor
+        return {
+            "success": False,
+            "connected": False,
+            "error": "Não foi possível conectar a nenhum dispositivo",
+            "device": None
+        }

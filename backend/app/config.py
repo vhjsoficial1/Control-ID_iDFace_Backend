@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     IDFACE2_GATEWAY: str
     IDFACE2_NETMASK: str
     
-    API_TITLE: str = "iDFace Control System"
+    API_TITLE: str = "Controle de Acesso IDFace - Maxplast"
     API_VERSION: str = "1.0.0"
     API_SECRET_KEY: str
     SESSION_TIMEOUT: int = 3600

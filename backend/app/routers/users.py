@@ -161,7 +161,7 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
 @router.get("/", response_model=UserListResponse)
 async def list_users(
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 1000,
     search: Optional[str] = None,
     db = Depends(get_db)
 ):

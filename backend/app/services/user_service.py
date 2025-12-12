@@ -252,7 +252,7 @@ class UserService:
         registration: Optional[str] = None,
         active_only: bool = False,
         skip: int = 0,
-        limit: int = 100
+        limit: int = 1000
     ) -> Dict[str, Any]:
         """
         Busca usuários com filtros avançados

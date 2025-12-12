@@ -134,7 +134,7 @@ async def create_time_zone(
 @router.get("/", response_model=List[TimeZoneResponse])
 async def list_time_zones(
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 1000,
     include_spans: bool = True,
     db = Depends(get_db)
 ):

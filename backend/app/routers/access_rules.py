@@ -191,7 +191,7 @@ async def _sync_rule_relationships(client, rule_id_device, rule_data, db):
 @router.get("/", response_model=List[AccessRuleResponse])
 async def list_access_rules(
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 1000,
     include_details: bool = True,
     db = Depends(get_db)
 ):

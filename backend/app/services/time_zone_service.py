@@ -266,11 +266,21 @@ class TimeZoneService:
                 # --- LEITOR 2 ---
                 try:
                     async with idface_client_2:
-                        # Tenta atualizar usando o mesmo ID (best effort)
-                        await idface_client_2.update_time_zone(
-                            existing_tz.idFaceId,
-                            update_data
+                        # 1. Encontre o objeto no leitor 2 pelo nome para obter seu ID específico
+                        search_result = await idface_client_2.request(
+                            "POST", "load_objects.fcgi",
+                            json={"object": "time_zones", "where": {"time_zones": {"name": existing_tz.name}}}
                         )
+                        
+                        if search_result and search_result.get("time_zones"):
+                            idface_id_2 = search_result["time_zones"][0]["id"]
+                            # 2. Atualize usando o ID correto para o leitor 2
+                            await idface_client_2.update_time_zone(
+                                idface_id_2,
+                                update_data
+                            )
+                        else:
+                            print(f"Aviso: Time zone '{existing_tz.name}' não encontrado no Leitor 2 para atualização.")
                 except Exception as sync_error:
                     print(f"Aviso: Falha ao atualizar Leitor 2: {sync_error}")
             
@@ -319,6 +329,7 @@ class TimeZoneService:
             
             # 2. Sync Remoto (Apenas se tivermos idFaceId no span)
             if existing_span.idFaceId:
+                parent_tz = await db.timezone.find_unique(where={"id": existing_span.timeZoneId})
                 # Reconstruir payload completo
                 full_payload = {
                     "start": update_data.get("start", existing_span.start),
@@ -342,10 +353,48 @@ class TimeZoneService:
                 except Exception as e: print(f"Erro update span L1: {e}")
 
                 # --- LEITOR 2 ---
-                try:
-                    async with idface_client_2:
-                        await idface_client_2.update_time_span(existing_span.idFaceId, full_payload)
-                except Exception as e: print(f"Erro update span L2: {e}")
+                if parent_tz:
+                    try:
+                        async with idface_client_2:
+                            tz_search = await idface_client_2.request(
+                                "POST", "load_objects.fcgi",
+                                json={"object": "time_zones", "where": {"time_zones": {"name": parent_tz.name}}}
+                            )
+                            if tz_search and tz_search.get("time_zones"):
+                                tz_id_L2 = tz_search["time_zones"][0]["id"]
+                                
+                                spans_search = await idface_client_2.request(
+                                    "POST", "load_objects.fcgi",
+                                    json={"object": "time_spans", "where": {"time_spans": {"time_zone_id": tz_id_L2}}}
+                                )
+                                
+                                if spans_search and spans_search.get("time_spans"):
+                                    span_to_update_L2 = None
+                                    for remote_span in spans_search["time_spans"]:
+                                        if (remote_span.get("start") == existing_span.start and
+                                            remote_span.get("end") == existing_span.end and
+                                            remote_span.get("mon") == (1 if existing_span.mon else 0) and
+                                            remote_span.get("tue") == (1 if existing_span.tue else 0) and
+                                            remote_span.get("wed") == (1 if existing_span.wed else 0) and
+                                            remote_span.get("thu") == (1 if existing_span.thu else 0) and
+                                            remote_span.get("fri") == (1 if existing_span.fri else 0) and
+                                            remote_span.get("sat") == (1 if existing_span.sat else 0) and
+                                            remote_span.get("sun") == (1 if existing_span.sun else 0) and
+                                            remote_span.get("hol1") == (1 if existing_span.hol1 else 0) and
+                                            remote_span.get("hol2") == (1 if existing_span.hol2 else 0) and
+                                            remote_span.get("hol3") == (1 if existing_span.hol3 else 0)):
+                                            span_to_update_L2 = remote_span
+                                            break
+                                    
+                                    if span_to_update_L2:
+                                        span_id_L2 = span_to_update_L2["id"]
+                                        await idface_client_2.update_time_span(span_id_L2, full_payload)
+                                    else:
+                                        print(f"Aviso: Span correspondente não encontrado no Leitor 2 para TZ '{parent_tz.name}'")
+                            else:
+                                print(f"Aviso: TZ '{parent_tz.name}' não encontrado no Leitor 2.")
+                    except Exception as e: print(f"Erro update span L2: {e}")
+
 
             return updated_span
 

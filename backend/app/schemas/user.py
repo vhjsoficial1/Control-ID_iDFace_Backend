@@ -61,6 +61,36 @@ class QRCodeResponse(BaseModel):
         from_attributes = True
 
 
+class GroupPartial(BaseModel):
+    id: int
+    name: str
+
+    class Config:
+        from_attributes = True
+
+
+class UserGroupResponse(BaseModel):
+    group: GroupPartial
+
+    class Config:
+        from_attributes = True
+
+
+class AccessRulePartial(BaseModel):
+    id: int
+    name: str
+
+    class Config:
+        from_attributes = True
+
+
+class UserAccessRuleResponse(BaseModel):
+    accessRule: AccessRulePartial
+
+    class Config:
+        from_attributes = True
+
+
 class UserResponse(UserBase):
     id: int
     idFaceId: Optional[int] = None
@@ -71,6 +101,8 @@ class UserResponse(UserBase):
     # Optional relationships
     cards: Optional[list[CardResponse]] = None
     qrcodes: Optional[list[QRCodeResponse]] = None
+    userGroups: Optional[list[UserGroupResponse]] = None
+    userAccessRules: Optional[list[UserAccessRuleResponse]] = None
     
     class Config:
         from_attributes = True

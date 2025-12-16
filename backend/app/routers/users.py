@@ -168,50 +168,43 @@ async def list_users(
     """
     Lista todos os usuários
     """
-    where = {}
-    if search:
-        where = {
-            "OR": [
-                {"name": {"contains": search, "mode": "insensitive"}},
-                {"registration": {"contains": search, "mode": "insensitive"}}
-            ]
-        }
-    
-    users = await db.user.find_many(
-        where=where,
+    user_service = UserService(db)
+    result = await user_service.search_users(
+        query=search,
         skip=skip,
-        take=limit,
-        include={
-            "cards": True,
-            "qrcodes": True
-        }
+        limit=limit
     )
     
-    total = await db.user.count(where=where)
-    
-    return UserListResponse(total=total, users=users)
+    if not result["success"]:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao buscar usuários: {result.get('errors')}"
+        )
+        
+    return UserListResponse(
+        total=result["total"],
+        users=result["users"]
+    )
 
 
-@router.get("/{user_id}", response_model=UserResponse)
+@router.get("/{user_id}")
 async def get_user(user_id: int, db = Depends(get_db)):
     """
     Busca um usuário por ID
     """
-    user = await db.user.find_unique(
-        where={"id": user_id},
-        include={
-            "cards": True,
-            "qrcodes": True
-        }
-    )
+    user_service = UserService(db)
+    result = await user_service.get_user_full_details(user_id)
     
-    if not user:
+    if not result["success"]:
+        error_detail = result.get("errors", ["Erro desconhecido"])[0]
+        status_code = status.HTTP_404_NOT_FOUND if "não encontrado" in error_detail else status.HTTP_500_INTERNAL_SERVER_ERROR
+        
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Usuário {user_id} não encontrado"
+            status_code=status_code,
+            detail=error_detail
         )
     
-    return user
+    return result
 
 
 @router.patch("/{user_id}", response_model=UserResponse)

@@ -291,9 +291,19 @@ class UserService:
                 take=limit,
                 include={
                     "cards": True,
-                    "qrcodes": True
+                    "qrcodes": True,
+                    "userGroups": {
+                        "include": {
+                            "group": True
+                        }
+                    },
+                    "userAccessRules": {
+                        "include": {
+                            "accessRule": True
+                        }
+                    }
                 },
-                order_by={"name": "asc"}
+                order={"name": "asc"}
             )
             
             total = await self.db.user.count(where=where)
@@ -324,6 +334,11 @@ class UserService:
                     "cards": True,
                     "qrcodes": True,
                     "templates": True,
+                    "userGroups": {
+                        "include": {
+                            "group": True
+                        }
+                    },
                     "userAccessRules": {
                         "include": {
                             "accessRule": {
@@ -339,7 +354,7 @@ class UserService:
                     },
                     "accessLogs": {
                         "take": 10,
-                        "order_by": {"timestamp": "desc"}
+                        "order": {"timestamp": "desc"}
                     }
                 }
             )

@@ -57,6 +57,10 @@ class GroupResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class GroupUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    timeZoneId: Optional[int] = None
+
 # ==================== Helpers ====================
 
 async def _safe_request(client, method, endpoint, **kwargs):
@@ -455,7 +459,16 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
                     "values": [{"group_id": l1_group_id, "access_rule_id": l1_ar_id}]
                 })
                 
-                # D) Vincular Portais (Todos)
+                # D) Vincular TimeZone (se fornecido)
+                if group.timeZoneId:
+                    tz = await db.timezone.find_unique(where={"id": group.timeZoneId})
+                    if tz and tz.idFaceId:
+                        await idface_client.request("POST", "create_objects.fcgi", json={
+                            "object": "access_rule_time_zones",
+                            "values": [{"access_rule_id": l1_ar_id, "time_zone_id": tz.idFaceId}]
+                        })
+
+                # E) Vincular Portais (Todos)
                 all_portals = await db.portal.find_many()
                 for portal in all_portals:
                     if portal.idFaceId:
@@ -476,6 +489,7 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
         print(f"❌ Erro Leitor 1 ao criar grupo: {e}")
 
     # ---------------- LEITOR 2 ----------------
+    l2_ar_id = None
     try:
         async with idface_client_2:
             # A) Criar Grupo
@@ -497,7 +511,22 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
                     "values": [{"group_id": l2_group_id, "access_rule_id": l2_ar_id}]
                 })
                 
-                # D) Vincular Portais (Todos)
+                # D) Vincular TimeZone (se fornecido)
+                if group.timeZoneId:
+                    tz = await db.timezone.find_unique(where={"id": group.timeZoneId})
+                    if tz:
+                        tz_search_l2 = await idface_client_2.request(
+                            "POST", "load_objects.fcgi",
+                            json={"object": "time_zones", "where": {"time_zones": {"name": tz.name}}}
+                        )
+                        if tz_search_l2 and tz_search_l2.get("time_zones"):
+                            tz_id_l2 = tz_search_l2["time_zones"][0]["id"]
+                            await idface_client_2.request("POST", "create_objects.fcgi", json={
+                                "object": "access_rule_time_zones",
+                                "values": [{"access_rule_id": l2_ar_id, "time_zone_id": tz_id_l2}]
+                            })
+
+                # E) Vincular Portais (Todos)
                 all_portals = await db.portal.find_many()
                 for portal in all_portals:
                     if portal.idFaceId:
@@ -558,18 +587,12 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
                         await _safe_request(idface_client, "POST", "create_objects.fcgi", json=req_data)
                         await _safe_request(idface_client_2, "POST", "create_objects.fcgi", json=req_data)
                         
-        # Adicionar TimeZone
+        # Adicionar TimeZone (Apenas localmente)
         if group.timeZoneId:
             tz = await db.timezone.find_unique(where={"id": group.timeZoneId})
             if tz:
                 await db.accessruletimezone.create(data={"accessRuleId": new_access_rule.id, "timeZoneId": tz.id})
-                if tz.idFaceId:
-                    req_data = {
-                        "object": "access_rule_time_zones",
-                        "values": [{"access_rule_id": new_access_rule.idFaceId, "time_zone_id": tz.idFaceId}]
-                    }
-                    await _safe_request(idface_client, "POST", "create_objects.fcgi", json=req_data)
-                    await _safe_request(idface_client_2, "POST", "create_objects.fcgi", json=req_data)
+
 
         return new_group
     else:
@@ -579,6 +602,251 @@ async def create_group(group: GroupCreate, db = Depends(get_db)):
 @router.get("/groups/", response_model=List[GroupResponse])
 async def list_groups(db = Depends(get_db)):
     return await db.group.find_many(order={"name": "asc"})
+
+
+@router.patch("/groups/{group_id}", response_model=GroupResponse)
+async def update_group(
+    group_id: int,
+    group_data: GroupUpdate,
+    db = Depends(get_db)
+):
+    existing_group = await db.group.find_unique(where={"id": group_id})
+    if not existing_group:
+        raise HTTPException(status_code=404, detail="Grupo não encontrado")
+
+    update_payload = group_data.model_dump(exclude_unset=True)
+    
+    # Handle TimeZone update if provided
+    new_tz_id = update_payload.pop("timeZoneId", None)
+    if new_tz_id is not None:
+        # Find the access rule associated with the group
+        group_rule_link = await db.groupaccessrule.find_first(
+            where={"groupId": group_id},
+            include={"accessRule": True}
+        )
+        
+        if group_rule_link and group_rule_link.accessRule:
+            access_rule = group_rule_link.accessRule
+            
+            # Find the new timezone
+            new_tz = await db.timezone.find_unique(where={"id": new_tz_id})
+            if not new_tz:
+                raise HTTPException(status_code=404, detail=f"TimeZone com ID {new_tz_id} não encontrado.")
+
+            # --- Update Local DB ---
+            await db.accessruletimezone.delete_many(where={"accessRuleId": access_rule.id})
+            await db.accessruletimezone.create(data={"accessRuleId": access_rule.id, "timeZoneId": new_tz.id})
+            
+            # --- Sync Remotely ---
+            if access_rule.idFaceId:
+                # --- LEITOR 1 ---
+                try:
+                    async with idface_client:
+                        # Clear old links
+                        await idface_client.request("POST", "destroy_objects.fcgi", json={
+                            "object": "access_rule_time_zones",
+                            "where": {"access_rule_time_zones": {"access_rule_id": access_rule.idFaceId}}
+                        })
+                        # Create new link
+                        if new_tz.idFaceId:
+                            await idface_client.request("POST", "create_objects.fcgi", json={
+                                "object": "access_rule_time_zones",
+                                "values": [{"access_rule_id": access_rule.idFaceId, "time_zone_id": new_tz.idFaceId}]
+                            })
+                except Exception as e:
+                    print(f"Erro ao atualizar TZ no Leitor 1: {e}")
+
+                # --- LEITOR 2 ---
+                try:
+                    async with idface_client_2:
+                        # Find AR on L2 by name
+                        ar_search = await idface_client_2.request("POST", "load_objects.fcgi", 
+                            json={"object": "access_rules", "where": {"access_rules": {"name": access_rule.name}}})
+                        
+                        # Find TZ on L2 by name
+                        tz_search = await idface_client_2.request("POST", "load_objects.fcgi",
+                            json={"object": "time_zones", "where": {"time_zones": {"name": new_tz.name}}})
+
+                        if ar_search.get("access_rules") and tz_search.get("time_zones"):
+                            ar_id_l2 = ar_search["access_rules"][0]["id"]
+                            tz_id_l2 = tz_search["time_zones"][0]["id"]
+
+                            # Clear old links
+                            await idface_client_2.request("POST", "destroy_objects.fcgi", json={
+                                "object": "access_rule_time_zones",
+                                "where": {"access_rule_time_zones": {"access_rule_id": ar_id_l2}}
+                            })
+                            # Create new link
+                            await idface_client_2.request("POST", "create_objects.fcgi", json={
+                                "object": "access_rule_time_zones",
+                                "values": [{"access_rule_id": ar_id_l2, "time_zone_id": tz_id_l2}]
+                            })
+                except Exception as e:
+                    print(f"Erro ao atualizar TZ no Leitor 2: {e}")
+
+    # Handle name update
+    if "name" in update_payload and update_payload["name"] != existing_group.name:
+        name_update_data = {"name": update_payload["name"]}
+        updated_group = await db.group.update(
+            where={"id": group_id},
+            data=name_update_data
+        )
+
+        if existing_group.idFaceId:
+            req_data = {
+                "object": "groups",
+                "values": name_update_data,
+                "where": {"groups": {"id": existing_group.idFaceId}}
+            }
+            await _safe_request(idface_client, "POST", "modify_objects.fcgi", json=req_data)
+            
+            # For reader 2, we need to find by old name
+            l2_req_data = {
+                "object": "groups",
+                "values": name_update_data,
+                "where": {"groups": {"name": existing_group.name}}
+            }
+            await _safe_request(idface_client_2, "POST", "modify_objects.fcgi", json=l2_req_data)
+            
+        return updated_group
+    
+    # If only TZ was updated, return the original group object
+    return existing_group
+
+
+@router.post("/groups/{group_id}/time-zones/{time_zone_id}", status_code=status.HTTP_201_CREATED)
+async def link_time_zone_to_group_access_rule(
+    group_id: int,
+    time_zone_id: int,
+    db = Depends(get_db)
+):
+    """
+    Associa um TimeZone à regra de acesso de um grupo específico, limpando vínculos anteriores.
+    """
+    # Find the group to ensure it exists
+    existing_group = await db.group.find_unique(where={"id": group_id})
+    if not existing_group:
+        raise HTTPException(status_code=404, detail="Grupo não encontrado")
+
+    # Find the access rule associated with the group
+    group_rule_link = await db.groupaccessrule.find_first(
+        where={"groupId": group_id},
+        include={"accessRule": True}
+    )
+    if not group_rule_link or not group_rule_link.accessRule:
+        raise HTTPException(status_code=404, detail="Regra de acesso para o grupo não encontrada.")
+    
+    access_rule = group_rule_link.accessRule
+
+    # Find the new timezone
+    new_tz = await db.timezone.find_unique(where={"id": time_zone_id})
+    if not new_tz:
+        raise HTTPException(status_code=404, detail=f"TimeZone com ID {time_zone_id} não encontrado.")
+
+    # --- Update Local DB ---
+    await db.accessruletimezone.delete_many(where={"accessRuleId": access_rule.id})
+    await db.accessruletimezone.create(data={"accessRuleId": access_rule.id, "timeZoneId": new_tz.id})
+    
+    # --- Sync Remotely ---
+    if access_rule.idFaceId:
+        # --- LEITOR 1 ---
+        try:
+            async with idface_client:
+                # Clear old links
+                await idface_client.request("POST", "destroy_objects.fcgi", json={
+                    "object": "access_rule_time_zones",
+                    "where": {"access_rule_time_zones": {"access_rule_id": access_rule.idFaceId}}
+                })
+                # Create new link
+                if new_tz.idFaceId:
+                    await idface_client.request("POST", "create_objects.fcgi", json={
+                        "object": "access_rule_time_zones",
+                        "values": [{"access_rule_id": access_rule.idFaceId, "time_zone_id": new_tz.idFaceId}]
+                    })
+        except Exception as e:
+            print(f"Erro ao atualizar TZ no Leitor 1: {e}")
+
+        # --- LEITOR 2 ---
+        try:
+            async with idface_client_2:
+                # Find AR on L2 by name
+                ar_search = await idface_client_2.request("POST", "load_objects.fcgi", 
+                    json={"object": "access_rules", "where": {"access_rules": {"name": access_rule.name}}})
+                
+                # Find TZ on L2 by name
+                tz_search = await idface_client_2.request("POST", "load_objects.fcgi",
+                    json={"object": "time_zones", "where": {"time_zones": {"name": new_tz.name}}})
+
+                if ar_search.get("access_rules") and tz_search.get("time_zones"):
+                    ar_id_l2 = ar_search["access_rules"][0]["id"]
+                    tz_id_l2 = tz_search["time_zones"][0]["id"]
+
+                    # Clear old links
+                    await idface_client_2.request("POST", "destroy_objects.fcgi", json={
+                        "object": "access_rule_time_zones",
+                        "where": {"access_rule_time_zones": {"access_rule_id": ar_id_l2}}
+                    })
+                    # Create new link
+                    await idface_client_2.request("POST", "create_objects.fcgi", json={
+                        "object": "access_rule_time_zones",
+                        "values": [{"access_rule_id": ar_id_l2, "time_zone_id": tz_id_l2}]
+                    })
+        except Exception as e:
+            print(f"Erro ao atualizar TZ no Leitor 2: {e}")
+            
+    return {"message": f"TimeZone '{new_tz.name}' associado com sucesso ao grupo '{existing_group.name}'."}
+
+
+@router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_group(group_id: int, db = Depends(get_db)):
+    """
+    Deleta um grupo e sua regra de acesso associada, tanto localmente quanto nos leitores.
+    """
+    # 1. Find local objects
+    existing_group = await db.group.find_unique(where={"id": group_id})
+    if not existing_group:
+        raise HTTPException(status_code=404, detail="Grupo não encontrado")
+
+    group_rule_link = await db.groupaccessrule.find_first(
+        where={"groupId": group_id},
+        include={"accessRule": True}
+    )
+    access_rule = group_rule_link.accessRule if group_rule_link else None
+
+    # 2. Sync Deletion with Readers
+    # --- LEITOR 1 ---
+    try:
+        async with idface_client:
+            if existing_group.idFaceId:
+                await idface_client.request("POST", "destroy_objects.fcgi", 
+                    json={"object": "groups", "where": {"groups": {"id": existing_group.idFaceId}}})
+            if access_rule and access_rule.idFaceId:
+                await idface_client.request("POST", "destroy_objects.fcgi", 
+                    json={"object": "access_rules", "where": {"access_rules": {"id": access_rule.idFaceId}}})
+        print("✅ Objetos (Grupo/Regra) deletados no Leitor 1.")
+    except Exception as e:
+        print(f"⚠️ Erro ao deletar no Leitor 1: {e}")
+
+    # --- LEITOR 2 ---
+    try:
+        async with idface_client_2:
+            # Delete group by name
+            await idface_client_2.request("POST", "destroy_objects.fcgi", 
+                json={"object": "groups", "where": {"groups": {"name": existing_group.name}}})
+            # Delete access rule by name
+            if access_rule:
+                await idface_client_2.request("POST", "destroy_objects.fcgi", 
+                    json={"object": "access_rules", "where": {"access_rules": {"name": access_rule.name}}})
+        print("✅ Objetos (Grupo/Regra) deletados no Leitor 2.")
+    except Exception as e:
+        print(f"⚠️ Erro ao deletar no Leitor 2: {e}")
+
+    # 3. Delete from Local DB
+    # Deleting the group will cascade to GroupAccessRule
+    await db.group.delete(where={"id": group_id})
+    # We need to explicitly delete the access rule
+    if access_rule:
+        await db.accessrule.delete(where={"id": access_rule.id})
 
 
 @router.post("/{rule_id}/groups/{group_id}")

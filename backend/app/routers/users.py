@@ -68,8 +68,10 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
     }
     
     # 2. Sincronizar com os leitores
+    image_sent_successfully = False
     try:
         # ===== LEITOR 1 =====
+        idface_id = None
         async with idface_client:
             # Criar usuário no leitor 1
             await idface_client.create_user(idface_data)
@@ -93,16 +95,21 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
             if temp_image:
                 try:
                     image_bytes = base64.b64decode(temp_image)
-                    await idface_client.set_user_image(
+                    response = await idface_client.set_user_image(
                         idface_id,
                         image_bytes,
                         match=True
                     )
+                    if "error" in response:
+                        raise ValueError(f"iDFace L1 error: {response['error']}")
+                    
                     print(f"✅ Imagem enviada para LEITOR 1 (iDFace ID: {idface_id})")
+                    image_sent_successfully = True
                 except Exception as img_error:
                     print(f"⚠️ Erro ao enviar imagem para LEITOR 1: {img_error}")
         
         # ===== LEITOR 2 (MESMA LÓGICA) =====
+        idface_id_2 = None
         async with idface_client_2:
             # Criar usuário no leitor 2
             await idface_client_2.create_user(idface_data)
@@ -126,26 +133,33 @@ async def create_user(user: UserCreate, db = Depends(get_db)):
             if temp_image:
                 try:
                     image_bytes = base64.b64decode(temp_image)
-                    await idface_client_2.set_user_image(
+                    response = await idface_client_2.set_user_image(
                         idface_id_2,
                         image_bytes,
                         match=True
                     )
+                    if "error" in response:
+                        raise ValueError(f"iDFace L2 error: {response['error']}")
+                        
                     print(f"✅ Imagem enviada para LEITOR 2 (iDFace ID: {idface_id_2})")
+                    image_sent_successfully = True
                 except Exception as img_error:
                     print(f"⚠️ Erro ao enviar imagem para LEITOR 2: {img_error}")
         
-        # 3. Atualizar banco local com o ID (salvando apenas do leitor 1, já que são iguais)
+        # 3. Atualizar banco local com o ID e a imagem (se tiver sido enviada com sucesso)
+        final_idface_id = idface_id or idface_id_2
+        image_to_save = temp_image if image_sent_successfully else None
+
         new_user = await db.user.update(
             where={"id": new_user.id},
             data={
-                "idFaceId": idface_id,
-                "image": temp_image if temp_image else None,
-                "imageTimestamp": datetime.now() if temp_image else None
+                "idFaceId": final_idface_id,
+                "image": image_to_save,
+                "imageTimestamp": datetime.now() if image_to_save else None
             }
         )
         
-        print(f"✅ Usuário {new_user.id} sincronizado nos 2 leitores (ID {idface_id})")
+        print(f"✅ Usuário {new_user.id} sincronizado nos 2 leitores (ID {final_idface_id})")
         
         return new_user
         

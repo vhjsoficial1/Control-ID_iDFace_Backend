@@ -16,6 +16,7 @@ model Admin {
   password  String   // Hash SHA256
   salt      String   // Salt para segurança
   active    Boolean  @default(true)
+  isMaster  Boolean  @default(false)
   
   createdAt DateTime @default(now())
   lastLogin DateTime?
@@ -47,6 +48,25 @@ model User {
   updatedAt DateTime @updatedAt
   
   @@map("users")
+}
+
+// ==================== VISITANTES ====================
+model Visitor {
+  id              Int       @id @default(autoincrement())
+  idFaceId        Int?      @unique
+  name            String
+  registration    String    // Empresa do visitante
+  image           String?
+  imageTimestamp  DateTime?
+  beginTime       DateTime
+  endTime         DateTime  // Válido até 23:59:59 dessa data
+  
+  accessLogs      AccessLog[]
+  
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  @@map("visitors")
 }
 
 // Cartões de acesso
@@ -253,6 +273,9 @@ model AccessLog {
   idFaceLogId Int      @unique // ID original do log no dispositivo iDFace
   userId      Int?
   user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  
+  visitorId   Int?
+  visitor     Visitor? @relation(fields: [visitorId], references: [id], onDelete: SetNull)
   
   portalId    Int?
   portal      Portal?  @relation(fields: [portalId], references: [id], onDelete: SetNull)

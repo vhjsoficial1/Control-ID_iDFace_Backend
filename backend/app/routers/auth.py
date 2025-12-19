@@ -99,12 +99,16 @@ async def login_admin(credentials: AdminLogin, response: Response, db = Depends(
     2. Verifica se admin existe e está ativo
     3. Compara senha fornecida com hash armazenado
     4. Atualiza data de último login
-    5. Retorna dados do admin
+    5. Retorna dados do admin com isMaster
+    
+    **isMaster no retorno:**
+    - True: Admin master com acesso a todas funcionalidades do dashboard
+    - False: Admin comum com acesso limitado (apenas Cadastro de Visitante)
     
     **Retorna:**
     - success: True se login bem-sucedido
     - message: Mensagem de sucesso
-    - admin: Dados do administrador
+    - admin: Dados do administrador (incluindo isMaster para controlar sidebar)
     """
     # Buscar admin por username
     admin = await db.admin.find_first(
@@ -184,9 +188,14 @@ async def verificar_sessao(admin_id: int, db = Depends(get_db)):
     **Uso:**
     - Frontend pode chamar para verificar se admin ainda está logado
     - Passar admin_id obtido do cookie ou storage
+    - Retorna dados completos do admin incluindo isMaster
     
     **Query Parameters:**
     - admin_id: ID do admin a verificar
+    
+    **Retorna:**
+    - valid: True se sessão é válida
+    - admin: Dados do admin (incluindo isMaster) ou null se inválido
     """
     admin = await db.admin.find_unique(
         where={"id": admin_id}

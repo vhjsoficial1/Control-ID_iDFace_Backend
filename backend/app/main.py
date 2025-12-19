@@ -13,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # Routers
-from app.routers import users, access_rules, time_zones, audit, sync, system, backup, report, realtime, capture, auth
+from app.routers import users, access_rules, time_zones, audit, sync, system, backup, report, realtime, capture, auth, visitor
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
@@ -121,6 +121,7 @@ async def root():
 
 # Include routers
 app.include_router(users.router, prefix="/api/v1/users", tags=["Users"])
+app.include_router(visitor.router, prefix="/api/v1/visitors", tags=["Visitors"])
 app.include_router(access_rules.router, prefix="/api/v1/access-rules", tags=["Access Rules"])
 app.include_router(time_zones.router, prefix="/api/v1/time-zones", tags=["Time Zones"])
 app.include_router(audit.router, prefix="/api/v1/audit", tags=["Audit"])

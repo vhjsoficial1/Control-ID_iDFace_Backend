@@ -20,10 +20,16 @@ class AdminLogin(BaseModel):
 
 
 class AdminResponse(BaseModel):
-    """Schema de resposta com dados do admin"""
+    """Schema de resposta com dados do admin
+    
+    **Atributo isMaster:**
+    - True: Admin master com acesso a todas as funcionalidades (Cadastros, Horários, Regras, Abrir Porta, Backup)
+    - False: Admin comum (visitante) com acesso limitado (apenas Cadastro de Visitante)
+    """
     id: int
     username: str
     active: bool
+    isMaster: bool
     createdAt: datetime
     lastLogin: Optional[datetime] = None
     
